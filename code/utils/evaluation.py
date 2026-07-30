@@ -1,154 +1,175 @@
-"""临床评估管线：面向乳腺癌分子亚型的多维度性能评估。
+"""通用分类评估工具和端到端预测语义。"""
 
-提供全局 Accuracy、逐类 Recall/Sensitivity、Specificity、Precision、
-F1-Score 以及混淆矩阵可视化。特别关注 HER2+ 与 TNBC 的分型指标。
+import os
 
-评估指标体系：
-    - 全局准确率 (Accuracy)
-    - 逐类灵敏度 (Recall / Sensitivity)
-    - 逐类特异度 (Specificity)
-    - 逐类阳性预测值 (Precision)
-    - 逐类 F1-Score
-    - 混淆矩阵 (Confusion Matrix)：分析各亚型间误判流向
-"""
+import matplotlib
 import numpy as np
+import torch
 from sklearn.metrics import (
     accuracy_score,
-    recall_score,
-    precision_score,
-    f1_score,
     confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
 )
-import matplotlib
-matplotlib.use("Agg")  # 无头后端，适用于服务器环境
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import os
 
 SUBTYPE_NAMES = ["Luminal A", "Luminal B", "HER2+", "TNBC"]
 
 
-def evaluate_predictions(y_true: np.ndarray, y_pred: np.ndarray, save_dir: str = None) -> dict:
-    """计算全面的临床评估指标。
+def evaluate_predictions(
+    y_true,
+    y_pred,
+    class_names=None,
+    focus_labels=None,
+    y_score=None,
+    save_dir=None,
+    figure_name="confusion_matrix.png",
+):
+    """按配置类别计算分类指标，可将宏平均限制在关注类别。"""
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    class_names = SUBTYPE_NAMES if class_names is None else list(class_names)
+    labels = list(range(len(class_names)))
+    focus_labels = labels if focus_labels is None else list(focus_labels)
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
 
-    Args:
-        y_true: (N,) 真实标签 (0-3)
-        y_pred: (N,) 预测标签 (0-3)
-        save_dir: 混淆矩阵图保存目录，为 None 则不保存
-
-    Returns:
-        包含全局指标、逐类指标、混淆矩阵的字典
-    """
-    # 全局准确率
-    acc = accuracy_score(y_true, y_pred)
-
-    # 逐类指标
-    recall = recall_score(y_true, y_pred, average=None, zero_division=0)      # 灵敏度
-    precision = precision_score(y_true, y_pred, average=None, zero_division=0)
-    f1 = f1_score(y_true, y_pred, average=None, zero_division=0)
-
-    # 逐类特异度: TN / (TN + FP)
-    cm = confusion_matrix(y_true, y_pred, labels=list(range(4)))
-    specificity = []
-    for i in range(4):
-        tn = cm.sum() - cm[i, :].sum() - cm[:, i].sum() + cm[i, i]
-        fp = cm[:, i].sum() - cm[i, i]
-        specificity.append(tn / (tn + fp + 1e-8))
-
-    # 宏平均
-    macro_recall = recall.mean()
-    macro_precision = precision.mean()
-    macro_f1 = f1.mean()
-    macro_specificity = np.mean(specificity)
-
-    # 加权平均
-    weighted_recall = recall_score(y_true, y_pred, average="weighted", zero_division=0)
-    weighted_f1 = f1_score(y_true, y_pred, average="weighted", zero_division=0)
-
-    results = {
-        "accuracy": acc,
-        "macro_recall": macro_recall,
-        "macro_precision": macro_precision,
-        "macro_f1": macro_f1,
-        "macro_specificity": macro_specificity,
-        "weighted_recall": weighted_recall,
-        "weighted_f1": weighted_f1,
-        "per_class": {},
-        "confusion_matrix": cm.tolist(),
-    }
-
-    # 逐类汇总
-    for i, name in enumerate(SUBTYPE_NAMES):
-        results["per_class"][name] = {
-            "recall": float(recall[i]),
-            "precision": float(precision[i]),
-            "specificity": float(specificity[i]),
-            "f1": float(f1[i]),
+    per_class = {}
+    for index, name in enumerate(class_names):
+        true_positive = int(((y_true == index) & (y_pred == index)).sum())
+        false_negative = int(((y_true == index) & (y_pred != index)).sum())
+        false_positive = int(((y_true != index) & (y_pred == index)).sum())
+        true_negative = int(((y_true != index) & (y_pred != index)).sum())
+        per_class[name] = {
+            "recall": true_positive / max(true_positive + false_negative, 1),
+            "precision": true_positive / max(true_positive + false_positive, 1),
+            "specificity": true_negative / max(true_negative + false_positive, 1),
+            "f1": (
+                2 * true_positive
+                / max(2 * true_positive + false_positive + false_negative, 1)
+            ),
         }
 
-    # HER2+ 与 TNBC 重点关注
-    results["HER2_plus"] = results["per_class"]["HER2+"]
-    results["TNBC"] = results["per_class"]["TNBC"]
-
-    # 保存混淆矩阵图
+    result = {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "balanced_accuracy": float(
+            recall_score(
+                y_true,
+                y_pred,
+                labels=focus_labels,
+                average="macro",
+                zero_division=0,
+            )
+        ),
+        "macro_precision": float(
+            precision_score(
+                y_true, y_pred, labels=focus_labels, average="macro", zero_division=0
+            )
+        ),
+        "macro_recall": float(
+            recall_score(
+                y_true, y_pred, labels=focus_labels, average="macro", zero_division=0
+            )
+        ),
+        "macro_f1": float(
+            f1_score(
+                y_true, y_pred, labels=focus_labels, average="macro", zero_division=0
+            )
+        ),
+        "weighted_f1": float(
+            f1_score(
+                y_true,
+                y_pred,
+                labels=focus_labels,
+                average="weighted",
+                zero_division=0,
+            )
+        ),
+        "per_class": per_class,
+        "confusion_matrix": cm.tolist(),
+        "label_distribution": np.bincount(
+            y_true, minlength=len(class_names)
+        ).tolist(),
+        "prediction_distribution": np.bincount(
+            y_pred, minlength=len(class_names)
+        ).tolist(),
+    }
+    if y_score is not None:
+        result["auc"] = float(roc_auc_score(y_true, np.asarray(y_score)))
     if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-        _plot_confusion_matrix(cm, save_dir)
-
-    return results
+        _plot_confusion_matrix(cm, class_names, save_dir, figure_name)
+    return result
 
 
-def _plot_confusion_matrix(cm: np.ndarray, save_dir: str):
-    """绘制并保存混淆矩阵图。
+def conditional_malignant_predictions(class_logits):
+    """忽略良性 logit，仅在四个恶性亚型中决策。"""
+    return class_logits[:, :4].argmax(dim=1).detach().cpu().numpy()
 
-    Args:
-        cm: (4, 4) 混淆矩阵
-        save_dir: 保存目录
-    """
+
+def end_to_end_flat5_predictions(class_logits):
+    """执行五分类端到端预测，类别 4 表示预测为良性。"""
+    return class_logits.argmax(dim=1).detach().cpu().numpy()
+
+
+def end_to_end_dual_predictions(malignancy_logits, subtype_logits):
+    """执行双头端到端预测，二分类良性结果映射为类别 4。"""
+    binary = malignancy_logits.argmax(dim=1)
+    subtype = subtype_logits.argmax(dim=1)
+    combined = torch.where(binary == 0, torch.full_like(subtype, 4), subtype)
+    return combined.detach().cpu().numpy()
+
+
+def _plot_confusion_matrix(cm, class_names, save_dir, figure_name):
+    """使用配置类别名称绘制并保存混淆矩阵。"""
+    os.makedirs(save_dir, exist_ok=True)
     fig, ax = plt.subplots(figsize=(8, 6))
     im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
     ax.figure.colorbar(im, ax=ax)
-
     ax.set(
-        xticks=np.arange(cm.shape[1]),
-        yticks=np.arange(cm.shape[0]),
-        xticklabels=SUBTYPE_NAMES,
-        yticklabels=SUBTYPE_NAMES,
-        title="Confusion Matrix",
-        xlabel="Predicted",
-        ylabel="True",
+        xticks=np.arange(len(class_names)),
+        yticks=np.arange(len(class_names)),
+        xticklabels=class_names,
+        yticklabels=class_names,
+        title="混淆矩阵",
+        xlabel="预测类别",
+        ylabel="真实类别",
     )
 
-    # 在每个单元格中标注数值
-    thresh = cm.max() / 2.0
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(j, i, format(cm[i, j], "d"),
-                    ha="center", va="center",
-                    color="white" if cm[i, j] > thresh else "black")
-
+    threshold = cm.max() / 2.0
+    for row in range(cm.shape[0]):
+        for column in range(cm.shape[1]):
+            ax.text(
+                column,
+                row,
+                format(cm[row, column], "d"),
+                ha="center",
+                va="center",
+                color="white" if cm[row, column] > threshold else "black",
+            )
     fig.tight_layout()
-    plt.savefig(os.path.join(save_dir, "confusion_matrix.png"), dpi=150)
-    plt.close()
+    plt.savefig(os.path.join(save_dir, figure_name), dpi=150)
+    plt.close(fig)
 
 
-def print_evaluation(results: dict):
-    """格式化打印评估结果。
-
-    Args:
-        results: evaluate_predictions 返回的结果字典
-    """
-    print(f"\n{'='*60}")
-    print(f"  临床评估报告 (Clinical Evaluation Report)")
-    print(f"{'='*60}")
-    print(f"  总体准确率 (Accuracy):  {results['accuracy']:.4f}")
-    print(f"  宏平均 F1 (Macro F1):   {results['macro_f1']:.4f}")
-    print(f"  宏平均灵敏度 (Recall):  {results['macro_recall']:.4f}")
-    print(f"  宏平均精确率 (Prec):    {results['macro_precision']:.4f}")
-    print(f"  宏平均特异度 (Spec):    {results['macro_specificity']:.4f}")
-    print(f"\n  {'类别':<12} {'灵敏度':>8} {'精确率':>8} {'特异度':>8} {'F1':>8}")
-    print(f"  {'-'*48}")
-    for name in SUBTYPE_NAMES:
-        c = results["per_class"][name]
-        print(f"  {name:<12} {c['recall']:>8.4f} {c['precision']:>8.4f} {c['specificity']:>8.4f} {c['f1']:>8.4f}")
-    print(f"\n  [重点关注] HER2+ 灵敏度: {results['HER2_plus']['recall']:.4f} | TNBC 灵敏度: {results['TNBC']['recall']:.4f}")
-    print(f"{'='*60}\n")
+def print_evaluation(results):
+    """按结果中的动态类别打印评估报告。"""
+    print("\n" + "=" * 60)
+    print("  分类评估报告")
+    print("=" * 60)
+    print(f"  总体准确率: {results['accuracy']:.4f}")
+    print(f"  宏平均 F1: {results['macro_f1']:.4f}")
+    print(f"  宏平均召回率: {results['macro_recall']:.4f}")
+    print(f"  宏平均精确率: {results['macro_precision']:.4f}")
+    print("\n  类别              召回率    精确率    特异度        F1")
+    print("  " + "-" * 52)
+    for name, metrics in results["per_class"].items():
+        print(
+            f"  {name:<16} {metrics['recall']:>7.4f}"
+            f" {metrics['precision']:>9.4f}"
+            f" {metrics['specificity']:>9.4f}"
+            f" {metrics['f1']:>9.4f}"
+        )
+    print("=" * 60 + "\n")
