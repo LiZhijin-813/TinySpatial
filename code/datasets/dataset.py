@@ -29,6 +29,24 @@ import numpy as np
 from transformers import AutoTokenizer
 
 
+def _normalize_labels(sample: Dict) -> Dict:
+    """统一恶性和良性样本的三类标签语义。"""
+    subtype_label = int(sample["subtype_label"])
+    if subtype_label in (-1, 4):
+        return {
+            "class_label": 4,
+            "malignancy_label": 0,
+            "subtype_label": -1,
+        }
+    if 0 <= subtype_label <= 3:
+        return {
+            "class_label": subtype_label,
+            "malignancy_label": 1,
+            "subtype_label": subtype_label,
+        }
+    raise ValueError(f"不支持的 subtype_label: {subtype_label}")
+
+
 class PairedAlignedTransform:
     """BUS 与 SWE 空间对齐增强。
 
@@ -98,6 +116,10 @@ class PairedEvaluationTransform:
         self.img_size = img_size
 
     def __call__(self, bus_img: Image.Image, swe_img: Image.Image):
+        if bus_img.size != swe_img.size:
+            raise ValueError(
+                f"BUS/SWE 原始尺寸不一致: BUS={bus_img.size}, SWE={swe_img.size}"
+            )
         bus_img = TF.resize(bus_img, self.img_size)
         swe_img = TF.resize(swe_img, self.img_size)
         bus_img = TF.center_crop(bus_img, [self.img_size, self.img_size])
@@ -129,10 +151,18 @@ class MultiModalBreastDataset(Dataset):
         subtype_label:   int — 分子亚型类别 (0-3)
 
     Attributes:
-        SUBTYPE_MAP: 亚型编号到名称的映射
+        SUBTYPE_MAP: 恶性亚型编号到名称的映射（0-3）
+        CLASS_MAP: 五分类编号到名称的映射（0-4，4 为良性）
     """
 
-    SUBTYPE_MAP = {0: "Luminal A", 1: "Luminal B", 2: "HER2+", 3: "TNBC", 4: "Benign"}
+    SUBTYPE_MAP = {0: "Luminal A", 1: "Luminal B", 2: "HER2+", 3: "TNBC"}
+    CLASS_MAP = {
+        0: "Luminal A",
+        1: "Luminal B",
+        2: "HER2+",
+        3: "TNBC",
+        4: "Benign",
+    }
 
     def __init__(
         self,
@@ -151,13 +181,16 @@ class MultiModalBreastDataset(Dataset):
         """
         Args:
             root_dir: 项目根目录路径
-            split: 数据划分，可选 "train"/"val"/"test"
+            split: 数据划分，可选 "train"/"val"/"test"；默认 train 使用随机增强，val/test 使用确定性变换
             img_size: 输出图像尺寸，默认 224×224
             max_text_len: 文本 tokenization 最大长度，默认 128
             tokenizer_name: HuggingFace tokenizer 名称
-            transform_paired: 自定义 BUS-SWE 对齐增强，默认使用 PairedAlignedTransform
-            transform_cdfi: 自定义 CDFI 独立增强，默认使用 CDFIIndependentTransform
+            transform_paired: 自定义 BUS-SWE 配对变换；默认按 augment 选择随机或确定性变换
+            transform_cdfi: 自定义 CDFI 变换；默认按 augment 选择随机或确定性变换
             metadata_file: 元数据文件名，默认 "metadata.csv"（4分类），五分类使用 "metadata_5class.csv"
+            samples: 可选的显式样本序列；提供时不读取 metadata 文件
+            augment: 是否启用随机增强；默认为 train 启用、val/test 禁用
+            tokenizer: 可选的 tokenizer；未提供时按 tokenizer_name 加载
         """
         self.root_dir = root_dir
         self.split = split
@@ -176,7 +209,11 @@ class MultiModalBreastDataset(Dataset):
         self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(tokenizer_name)
 
         # 按 split 加载元数据
-        self.samples = [dict(sample) for sample in samples] if samples is not None else self._load_metadata()
+        self.samples = (
+            [{**_normalize_labels(sample), "case_id": sample["case_id"]} for sample in samples]
+            if samples is not None
+            else self._load_metadata()
+        )
 
         # 初始化增强策略
         self.augment = (split == "train") if augment is None else augment
@@ -217,15 +254,12 @@ class MultiModalBreastDataset(Dataset):
             reader = csv.DictReader(f)
             for row in reader:
                 if row["split"] == self.split:
-                    subtype_label = int(row["subtype_label"])
-                    samples.append({
-                        "case_id": row["case_id"],
-                        "class_label": int(row.get("class_label", subtype_label)),
-                        "malignancy_label": int(
-                            row.get("malignancy_label", int(subtype_label < 4))
-                        ),
-                        "subtype_label": subtype_label,
-                    })
+                    samples.append(
+                        {
+                            "case_id": row["case_id"],
+                            **_normalize_labels(row),
+                        }
+                    )
         return samples
 
     def __len__(self) -> int:
@@ -261,7 +295,7 @@ class MultiModalBreastDataset(Dataset):
 
         # 加载临床文本并进行 tokenization
         text_path = os.path.join(self.texts_dir, f"{case_id}.json")
-        with open(text_path, "r") as f:
+        with open(text_path, "r", encoding="utf-8") as f:
             text_data = json.load(f)
         raw_text = text_data.get("raw_text", "")
 
@@ -280,10 +314,7 @@ class MultiModalBreastDataset(Dataset):
             "cdfi_img": cdfi_tensor,
             "input_ids": encoding["input_ids"].squeeze(0),
             "attention_mask": encoding["attention_mask"].squeeze(0),
-            "class_label": sample.get("class_label", sample["subtype_label"]),
-            "malignancy_label": sample.get(
-                "malignancy_label",
-                int(sample["subtype_label"] < 4),
-            ),
+            "class_label": sample["class_label"],
+            "malignancy_label": sample["malignancy_label"],
             "subtype_label": sample["subtype_label"],
         }
