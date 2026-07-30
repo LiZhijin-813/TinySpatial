@@ -219,13 +219,11 @@ def _plot_confusion_matrix(cm, class_names, save_dir, figure_name):
     ax.figure.colorbar(im, ax=ax)
     ax.set_xticks(np.arange(len(class_names)))
     ax.set_yticks(np.arange(len(class_names)))
-    ax.set_xticklabels(class_names, fontproperties=chinese_font)
-    ax.set_yticklabels(class_names, fontproperties=chinese_font)
+    ax.set_xticklabels(class_names)
+    ax.set_yticklabels(class_names)
     ax.set_title("混淆矩阵", fontproperties=chinese_font)
     ax.set_xlabel("预测类别", fontproperties=chinese_font)
     ax.set_ylabel("真实类别", fontproperties=chinese_font)
-    for tick in ax.get_xticklabels() + ax.get_yticklabels():
-        tick.set_fontproperties(chinese_font)
 
     threshold = cm.max() / 2.0
     for row in range(cm.shape[0]):
@@ -237,7 +235,6 @@ def _plot_confusion_matrix(cm, class_names, save_dir, figure_name):
                 ha="center",
                 va="center",
                 color="white" if cm[row, column] > threshold else "black",
-                fontproperties=chinese_font,
             )
     fig.tight_layout()
     plt.savefig(os.path.join(save_dir, figure_name), dpi=150)
