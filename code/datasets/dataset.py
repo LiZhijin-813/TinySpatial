@@ -91,6 +91,30 @@ class CDFIIndependentTransform:
         return self.transform(cdfi_img)
 
 
+class PairedEvaluationTransform:
+    """BUS 与 SWE 的确定性等比例缩放和中心裁剪。"""
+
+    def __init__(self, img_size: int = 224):
+        self.img_size = img_size
+
+    def __call__(self, bus_img: Image.Image, swe_img: Image.Image):
+        bus_img = TF.resize(bus_img, self.img_size)
+        swe_img = TF.resize(swe_img, self.img_size)
+        bus_img = TF.center_crop(bus_img, [self.img_size, self.img_size])
+        swe_img = TF.center_crop(swe_img, [self.img_size, self.img_size])
+        return bus_img, swe_img
+
+
+class CDFIEvaluationTransform:
+    """CDFI 的确定性缩放。"""
+
+    def __init__(self, img_size: int = 224):
+        self.transform = transforms.Resize((img_size, img_size))
+
+    def __call__(self, cdfi_img: Image.Image):
+        return self.transform(cdfi_img)
+
+
 class MultiModalBreastDataset(Dataset):
     """多模态乳腺超声数据集。
 
@@ -120,6 +144,9 @@ class MultiModalBreastDataset(Dataset):
         transform_paired: Optional[Callable] = None,
         transform_cdfi: Optional[Callable] = None,
         metadata_file: str = "metadata.csv",
+        samples: Optional[List[Dict]] = None,
+        augment: Optional[bool] = None,
+        tokenizer=None,
     ):
         """
         Args:
@@ -146,14 +173,27 @@ class MultiModalBreastDataset(Dataset):
         self.texts_dir = os.path.join(self.data_dir, "texts")
 
         # 加载 BioClinicalBERT tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(tokenizer_name)
 
         # 按 split 加载元数据
-        self.samples = self._load_metadata()
+        self.samples = [dict(sample) for sample in samples] if samples is not None else self._load_metadata()
 
         # 初始化增强策略
-        self.transform_paired = transform_paired or PairedAlignedTransform(img_size)
-        self.transform_cdfi = transform_cdfi or CDFIIndependentTransform(img_size)
+        self.augment = (split == "train") if augment is None else augment
+        if transform_paired is None:
+            transform_paired = (
+                PairedAlignedTransform(img_size)
+                if self.augment
+                else PairedEvaluationTransform(img_size)
+            )
+        if transform_cdfi is None:
+            transform_cdfi = (
+                CDFIIndependentTransform(img_size)
+                if self.augment
+                else CDFIEvaluationTransform(img_size)
+            )
+        self.transform_paired = transform_paired
+        self.transform_cdfi = transform_cdfi
 
         # 几何增强后的归一化与张量转换
         self.bus_normalize = transforms.Compose([
@@ -177,9 +217,14 @@ class MultiModalBreastDataset(Dataset):
             reader = csv.DictReader(f)
             for row in reader:
                 if row["split"] == self.split:
+                    subtype_label = int(row["subtype_label"])
                     samples.append({
                         "case_id": row["case_id"],
-                        "subtype_label": int(row["subtype_label"]),
+                        "class_label": int(row.get("class_label", subtype_label)),
+                        "malignancy_label": int(
+                            row.get("malignancy_label", int(subtype_label < 4))
+                        ),
+                        "subtype_label": subtype_label,
                     })
         return samples
 
@@ -229,10 +274,16 @@ class MultiModalBreastDataset(Dataset):
         )
 
         return {
+            "case_id": case_id,
             "bus_img": bus_tensor,
             "swe_img": swe_tensor,
             "cdfi_img": cdfi_tensor,
             "input_ids": encoding["input_ids"].squeeze(0),
             "attention_mask": encoding["attention_mask"].squeeze(0),
+            "class_label": sample.get("class_label", sample["subtype_label"]),
+            "malignancy_label": sample.get(
+                "malignancy_label",
+                int(sample["subtype_label"] < 4),
+            ),
             "subtype_label": sample["subtype_label"],
         }
