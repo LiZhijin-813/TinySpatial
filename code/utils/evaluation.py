@@ -214,13 +214,14 @@ def _plot_confusion_matrix(cm, class_names, save_dir, figure_name):
     """使用配置类别名称和可用中文字体绘制混淆矩阵。"""
     os.makedirs(save_dir, exist_ok=True)
     chinese_font = _find_chinese_font()
+    latin_font = font_manager.FontProperties(family="DejaVu Sans")
     fig, ax = plt.subplots(figsize=(8, 6))
     im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
     ax.figure.colorbar(im, ax=ax)
     ax.set_xticks(np.arange(len(class_names)))
     ax.set_yticks(np.arange(len(class_names)))
-    ax.set_xticklabels(class_names)
-    ax.set_yticklabels(class_names)
+    ax.set_xticklabels(class_names, fontproperties=latin_font)
+    ax.set_yticklabels(class_names, fontproperties=latin_font)
     ax.set_title("混淆矩阵", fontproperties=chinese_font)
     ax.set_xlabel("预测类别", fontproperties=chinese_font)
     ax.set_ylabel("真实类别", fontproperties=chinese_font)
@@ -235,6 +236,7 @@ def _plot_confusion_matrix(cm, class_names, save_dir, figure_name):
                 ha="center",
                 va="center",
                 color="white" if cm[row, column] > threshold else "black",
+                fontproperties=latin_font,
             )
     fig.tight_layout()
     plt.savefig(os.path.join(save_dir, figure_name), dpi=150)
