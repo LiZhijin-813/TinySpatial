@@ -1,6 +1,7 @@
 """通用分类评估工具和端到端预测语义。"""
 
 import os
+import re
 
 import matplotlib
 import numpy as np
@@ -198,6 +199,12 @@ def end_to_end_dual_predictions(malignancy_logits, subtype_logits):
 
 def _find_chinese_font():
     """按优先级查找可用的中文字体。"""
+    for font_path in sorted(font_manager.findSystemFonts()):
+        normalized_name = re.sub(
+            r"[^a-z0-9]", "", os.path.basename(font_path).lower()
+        )
+        if "notosanscjk" in normalized_name:
+            return font_manager.FontProperties(fname=font_path)
     for font_name in _CHINESE_FONT_NAMES:
         try:
             font_path = font_manager.findfont(
