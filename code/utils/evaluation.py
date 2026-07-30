@@ -31,11 +31,17 @@ _CHINESE_FONT_NAMES = [
 
 def _validate_class_names(class_names):
     """校验类别名称非空且不重复。"""
+    if isinstance(class_names, (str, bytes)):
+        raise ValueError("class_names 必须是类别名称集合")
     try:
         names = SUBTYPE_NAMES if class_names is None else list(class_names)
     except TypeError as error:
         raise ValueError("class_names 必须是非空类别名称集合") from error
-    if not names or len(set(names)) != len(names):
+    if (
+        not names
+        or any(not isinstance(name, str) or not name.strip() for name in names)
+        or len(set(names)) != len(names)
+    ):
         raise ValueError("class_names 必须非空且唯一")
     return names
 
@@ -179,18 +185,35 @@ def evaluate_predictions(
     return result
 
 
+def _validate_logits_shape(logits, name, class_count=None, minimum_classes=None):
+    """校验分类 logits 为二维张量并满足类别数约束。"""
+    if not isinstance(logits, torch.Tensor) or logits.ndim != 2:
+        raise ValueError(f"{name} 必须是二维张量")
+    actual_classes = logits.shape[1]
+    if class_count is not None and actual_classes != class_count:
+        raise ValueError(f"{name} 必须包含 {class_count} 个类别")
+    if minimum_classes is not None and actual_classes < minimum_classes:
+        raise ValueError(f"{name} 至少需要包含 {minimum_classes} 个类别")
+
+
 def conditional_malignant_predictions(class_logits):
     """忽略良性 logit，仅在四个恶性亚型中决策。"""
+    _validate_logits_shape(class_logits, "class_logits", minimum_classes=4)
     return class_logits[:, :4].argmax(dim=1).detach().cpu().numpy()
 
 
 def end_to_end_flat5_predictions(class_logits):
     """执行五分类端到端预测，类别 4 表示预测为良性。"""
+    _validate_logits_shape(class_logits, "class_logits", class_count=5)
     return class_logits.argmax(dim=1).detach().cpu().numpy()
 
 
 def end_to_end_dual_predictions(malignancy_logits, subtype_logits):
     """执行双头端到端预测，二分类良性结果映射为类别 4。"""
+    _validate_logits_shape(malignancy_logits, "malignancy_logits", class_count=2)
+    _validate_logits_shape(subtype_logits, "subtype_logits", class_count=4)
+    if malignancy_logits.shape[0] != subtype_logits.shape[0]:
+        raise ValueError("两个预测头的批次大小必须一致")
     binary = malignancy_logits.argmax(dim=1)
     subtype = subtype_logits.argmax(dim=1)
     combined = torch.where(binary == 0, torch.full_like(subtype, 4), subtype)
