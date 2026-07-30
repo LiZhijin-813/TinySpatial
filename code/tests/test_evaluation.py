@@ -147,3 +147,69 @@ def test_save_dir_keyword_uses_default_classes_and_requested_figure_name(tmp_pat
     )
     assert set(result["per_class"]) == set(SUBTYPES)
     assert (tmp_path / figure_name).is_file()
+
+
+@pytest.mark.parametrize(
+    "class_names",
+    [
+        "AB",
+        ["", "B"],
+        ["A", 1],
+        ["A", "A"],
+    ],
+)
+def test_class_names_must_be_nonempty_unique_strings(class_names):
+    """class_names 必须是非空字符串组成且名称不能重复。"""
+    with pytest.raises(ValueError):
+        evaluate_predictions(
+            np.array([0, 1]),
+            np.array([0, 1]),
+            class_names=class_names,
+        )
+
+
+@pytest.mark.parametrize(
+    "logits",
+    [
+        torch.tensor([1.0, 2.0, 3.0, 4.0]),
+        torch.ones(2, 3),
+        torch.ones(2, 4, 1),
+    ],
+)
+def test_conditional_predictions_reject_invalid_logits(logits):
+    """条件恶性预测要求二维且至少包含四个类别。"""
+    with pytest.raises(ValueError):
+        conditional_malignant_predictions(logits)
+
+
+@pytest.mark.parametrize(
+    "logits",
+    [
+        torch.ones(5),
+        torch.ones(2, 4),
+        torch.ones(2, 6),
+        torch.ones(2, 5, 1),
+    ],
+)
+def test_flat5_predictions_require_exactly_five_logits(logits):
+    """flat5 端到端预测要求输入严格为 [N, 5]。"""
+    with pytest.raises(ValueError):
+        end_to_end_flat5_predictions(logits)
+
+
+@pytest.mark.parametrize(
+    "malignancy_logits, subtype_logits",
+    [
+        (torch.ones(2, 3), torch.ones(2, 4)),
+        (torch.ones(2, 2), torch.ones(2, 5)),
+        (torch.ones(2, 2), torch.ones(1, 4)),
+        (torch.ones(2), torch.ones(2, 4)),
+        (torch.ones(2, 2), torch.ones(2, 4, 1)),
+    ],
+)
+def test_dual_predictions_require_valid_head_shapes(
+    malignancy_logits, subtype_logits
+):
+    """dual_head 预测要求两个二维头部形状和批次严格匹配。"""
+    with pytest.raises(ValueError):
+        end_to_end_dual_predictions(malignancy_logits, subtype_logits)
