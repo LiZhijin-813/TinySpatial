@@ -16,7 +16,6 @@ os.environ['HF_HUB_DOWNLOAD_ENDPOINT'] = 'https://hf-mirror.com'
 
 import json
 import csv
-import math
 import random
 from typing import Dict, Optional, Callable, List, Tuple
 
@@ -48,24 +47,27 @@ def _normalize_labels(sample: Dict) -> Dict:
 
 
 class PairedAlignedTransform:
-    """BUS 与 SWE 空间对齐增强。
+    """BUS 与 SWE 归一化坐标下的共享空间增强。
 
-    对 BUS 和 SWE 图像执行共享随机参数的仿射变换（随机裁剪、水平翻转、旋转），
-    确保两模态特征空间的相对坐标绝对静止，维持解剖结构与硬度分布的像素级对应。
+    先将两种导出分辨率映射到同一归一化坐标网格，再执行共享随机参数的
+    裁剪、水平翻转和旋转。该变换保留病例内的近似解剖对应，不假设原始
+    文件具有严格的像素级尺寸一致性。
     """
 
     def __init__(self, img_size: int = 224):
         self.img_size = img_size
 
+    def _resize_to_coordinate_grid(self, image: Image.Image):
+        """将单模态导出图映射到公共归一化坐标网格。"""
+        return TF.resize(
+            image,
+            [self.img_size, self.img_size],
+            antialias=True,
+        )
+
     def __call__(self, bus_img: Image.Image, swe_img: Image.Image):
-        # 先将短边缩放至至少 img_size，确保图像足够大以支持 RandomCrop
-        w, h = bus_img.size
-        scale = max(self.img_size / w, self.img_size / h)
-        if scale > 1.0:
-            new_w = max(math.ceil(w * scale), self.img_size)
-            new_h = max(math.ceil(h * scale), self.img_size)
-            bus_img = TF.resize(bus_img, [new_h, new_w])
-            swe_img = TF.resize(swe_img, [new_h, new_w])
+        bus_img = self._resize_to_coordinate_grid(bus_img)
+        swe_img = self._resize_to_coordinate_grid(swe_img)
 
         # 共享随机裁剪参数：确保裁剪区域完全一致
         i, j, h, w = transforms.RandomCrop.get_params(
@@ -110,20 +112,22 @@ class CDFIIndependentTransform:
 
 
 class PairedEvaluationTransform:
-    """BUS 与 SWE 的确定性等比例缩放和中心裁剪。"""
+    """BUS 与 SWE 的确定性归一化坐标缩放。"""
 
     def __init__(self, img_size: int = 224):
         self.img_size = img_size
 
     def __call__(self, bus_img: Image.Image, swe_img: Image.Image):
-        if bus_img.size != swe_img.size:
-            raise ValueError(
-                f"BUS/SWE 原始尺寸不一致: BUS={bus_img.size}, SWE={swe_img.size}"
-            )
-        bus_img = TF.resize(bus_img, self.img_size)
-        swe_img = TF.resize(swe_img, self.img_size)
-        bus_img = TF.center_crop(bus_img, [self.img_size, self.img_size])
-        swe_img = TF.center_crop(swe_img, [self.img_size, self.img_size])
+        bus_img = TF.resize(
+            bus_img,
+            [self.img_size, self.img_size],
+            antialias=True,
+        )
+        swe_img = TF.resize(
+            swe_img,
+            [self.img_size, self.img_size],
+            antialias=True,
+        )
         return bus_img, swe_img
 
 

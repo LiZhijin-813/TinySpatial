@@ -173,9 +173,51 @@ def test_clinical_text_json_is_opened_with_utf8(
     assert encodings == ["utf-8"]
 
 
-def test_evaluation_transform_rejects_mismatched_paired_sizes():
-    """BUS 和 SWE 原始尺寸不一致时，评估变换必须拒绝伪对齐。"""
-    bus = Image.new("RGB", (300, 300), color=(128, 0, 0))
-    swe = Image.new("RGB", (280, 300), color=(0, 0, 128))
-    with pytest.raises(ValueError):
-        PairedEvaluationTransform(img_size=224)(bus, swe)
+def test_evaluation_transform_normalizes_mismatched_paired_sizes():
+    """评估应在归一化坐标系中确定性处理不同的导出尺寸。"""
+    bus = Image.new("RGB", (310, 380), color=(128, 0, 0))
+    swe = Image.new("RGB", (368, 372), color=(0, 0, 128))
+    paired = PairedEvaluationTransform(img_size=224)
+
+    first_bus, first_swe = paired(bus, swe)
+    second_bus, second_swe = paired(bus, swe)
+
+    assert first_bus.size == first_swe.size == (224, 224)
+    assert first_bus.tobytes() == second_bus.tobytes()
+    assert first_swe.tobytes() == second_swe.tobytes()
+
+
+def test_training_transform_normalizes_mismatched_paired_sizes():
+    """训练应在归一化坐标系中对不同尺寸的 BUS/SWE 共享几何变换。"""
+    bus = Image.new("RGB", (310, 380), color=(128, 0, 0))
+    swe = Image.new("RGB", (368, 372), color=(0, 0, 128))
+
+    bus_out, swe_out = PairedAlignedTransform(img_size=224)(bus, swe)
+
+    assert bus_out.size == swe_out.size == (224, 224)
+
+
+def test_dataset_reads_mismatched_paired_sizes_after_normalization(
+    tiny_multimodal_root,
+    fake_tokenizer,
+):
+    """真实数据集入口不应因 BUS/SWE 导出尺寸不同而中断。"""
+    root, samples = tiny_multimodal_root
+    case_id = samples[0]["case_id"]
+    Image.new("RGB", (368, 372), color=(0, 0, 128)).save(
+        root / "data" / "images" / "SWE" / f"{case_id}.jpg"
+    )
+    dataset = MultiModalBreastDataset(
+        root_dir=str(root),
+        split="val",
+        img_size=224,
+        max_text_len=16,
+        samples=[samples[0]],
+        augment=False,
+        tokenizer=fake_tokenizer,
+    )
+
+    sample = dataset[0]
+
+    assert sample["bus_img"].shape == (1, 224, 224)
+    assert sample["swe_img"].shape == (3, 224, 224)
