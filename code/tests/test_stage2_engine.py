@@ -114,6 +114,16 @@ class _EvaluationModel(nn.Module):
         }
 
 
+class _OverfitEvaluationModel(nn.Module):
+    """将 BUS 输入直接解释为过拟合探针 logits 的假模型。"""
+
+    def forward(self, bus_img):
+        return {
+            "class_logits": bus_img,
+            "image_features": bus_img[:, :2],
+        }
+
+
 class _CountingSGD(torch.optim.SGD):
     """记录真实 optimizer.step 调用次数的 SGD。"""
 
@@ -124,6 +134,20 @@ class _CountingSGD(torch.optim.SGD):
     def step(self, closure=None):
         self.step_count += 1
         return super().step(closure)
+
+
+class _DeceptiveLoader:
+    """长度报告与真实迭代批次数不同的数据加载器。"""
+
+    def __init__(self, batches, reported_len):
+        self.batches = batches
+        self.reported_len = reported_len
+
+    def __len__(self):
+        return self.reported_len
+
+    def __iter__(self):
+        return iter(self.batches)
 
 
 def _training_batch(subtype_labels=(2, 1)):
@@ -272,8 +296,11 @@ def test_dual_head_training_uses_binary_and_malignant_subtype_losses():
     } <= metrics.keys()
 
 
-def test_gradient_accumulation_rescales_incomplete_final_group():
-    """最后不足 accum_steps 的累积组必须按实际批次数缩放。"""
+@pytest.mark.parametrize("reported_len", [4, 2])
+def test_gradient_accumulation_uses_actual_batches_not_reported_length(
+    reported_len,
+):
+    """梯度累积必须按真实迭代分组而不是依赖 loader 报告长度。"""
     model = _OverfitTrainingModel()
     optimizer = _CountingSGD(model.parameters(), lr=1.0)
     batches = [
@@ -281,10 +308,11 @@ def test_gradient_accumulation_rescales_incomplete_final_group():
         _training_batch(subtype_labels=(0,)),
         _training_batch(subtype_labels=(0,)),
     ]
+    loader = _DeceptiveLoader(batches, reported_len)
 
     train_one_epoch(
         model,
-        batches,
+        loader,
         optimizer,
         {"class": _UnitGradientCriterion()},
         "overfit",
@@ -295,6 +323,68 @@ def test_gradient_accumulation_rescales_incomplete_final_group():
 
     assert optimizer.step_count == 2
     assert model.class_bias[0].item() == pytest.approx(-2.0)
+
+
+def test_flat4_training_accuracy_uses_subtype_labels():
+    """flat4 accuracy 必须按 subtype_label 统计而不是 class_label。"""
+    batch = _training_batch(subtype_labels=(0, 0))
+    batch["class_label"] = torch.tensor([4, 1])
+    model = _MultimodalTrainingModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+    metrics = train_one_epoch(
+        model,
+        [batch],
+        optimizer,
+        {"class": _RecordingCriterion()},
+        "flat4",
+        torch.device("cpu"),
+        max_grad_norm=0,
+    )
+
+    assert metrics["accuracy"] == pytest.approx(1.0)
+
+
+def test_flat5_training_accuracy_uses_class_labels():
+    """flat5 accuracy 必须按 class_label 统计而不是 subtype_label。"""
+    batch = _training_batch(subtype_labels=(1, 1))
+    batch["class_label"] = torch.tensor([0, 1])
+    model = _MultimodalTrainingModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+    metrics = train_one_epoch(
+        model,
+        [batch],
+        optimizer,
+        {"class": _RecordingCriterion()},
+        "flat5",
+        torch.device("cpu"),
+        max_grad_norm=0,
+    )
+
+    assert metrics["accuracy"] == pytest.approx(0.5)
+
+
+def test_dual_training_accuracy_uses_only_malignant_subtypes():
+    """dual_head accuracy 分母必须排除良性样本。"""
+    batch = _training_batch(subtype_labels=(1, 0))
+    model = _MultimodalTrainingModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+    metrics = train_one_epoch(
+        model,
+        [batch],
+        optimizer,
+        {
+            "malignancy": _RecordingCriterion(),
+            "subtype": _RecordingCriterion(),
+        },
+        "dual_head",
+        torch.device("cpu"),
+        max_grad_norm=0,
+    )
+
+    assert metrics["accuracy"] == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize("accum_steps", [0, -1, 1.5, True])
@@ -353,6 +443,26 @@ def test_train_rejects_unknown_task_mode():
     _assert_chinese_value_error(error)
 
 
+def test_evaluate_overfit_reports_malignant_metrics():
+    """overfit 评估必须通过 BUS-only 调用返回四亚型恶性指标。"""
+    batch = _evaluation_batch(
+        torch.eye(4) * 5,
+        subtype_labels=[0, 1, 2, 3],
+    )
+
+    metrics = evaluate_loader(
+        _OverfitEvaluationModel(),
+        [batch],
+        "overfit",
+        torch.device("cpu"),
+        "malignant",
+    )
+
+    assert metrics["malignant"]["accuracy"] == pytest.approx(1.0)
+    assert metrics["malignant"]["macro_f1"] == pytest.approx(1.0)
+    assert "diagnostic" in metrics
+
+
 def test_evaluate_flat4_reports_malignant_metrics():
     """flat4 评估必须返回四亚型恶性指标。"""
     batch = _evaluation_batch(
@@ -395,6 +505,10 @@ def test_evaluate_flat5_malignant_reports_conditional_and_end_to_end_metrics():
 
     assert metrics["malignant"]["macro_f1"] == pytest.approx(1.0)
     assert metrics["malignant_end_to_end"]["accuracy"] == pytest.approx(0.75)
+    assert metrics["malignant_end_to_end"]["macro_f1"] == pytest.approx(0.75)
+    assert metrics["malignant_end_to_end"][
+        "balanced_accuracy"
+    ] == pytest.approx(0.75)
     assert "overall" not in metrics
     assert monitor_value(metrics, "malignant_macro_f1") == pytest.approx(1.0)
 
@@ -453,6 +567,10 @@ def test_evaluate_dual_malignant_reports_conditional_and_end_to_end_metrics():
 
     assert metrics["malignant"]["macro_f1"] == pytest.approx(1.0)
     assert metrics["malignant_end_to_end"]["accuracy"] == pytest.approx(0.75)
+    assert metrics["malignant_end_to_end"]["macro_f1"] == pytest.approx(0.75)
+    assert metrics["malignant_end_to_end"][
+        "balanced_accuracy"
+    ] == pytest.approx(0.75)
 
 
 def test_evaluate_dual_binary_reports_binary_metrics():
