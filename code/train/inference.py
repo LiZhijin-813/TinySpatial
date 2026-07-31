@@ -30,7 +30,11 @@ SUBTYPE_NAMES_5 = ["Luminal A", "Luminal B", "HER2+", "TNBC", "Benign"]
 
 
 def task_predictions_and_probabilities(outputs, task_mode):
-    """按任务模式将结构化 logits 转换为预测类别和概率。"""
+    """按任务模式将结构化 logits 转换为硬预测和概率诊断量。
+
+    双头模式的硬预测由良恶性头门控，返回的五类概率仅用于诊断，
+    不保证其最大项与硬预测类别相同。
+    """
     if task_mode in {"flat4", "flat5"}:
         probabilities = torch.softmax(outputs["class_logits"], dim=1)
         return probabilities.argmax(dim=1), probabilities
@@ -55,6 +59,64 @@ def task_predictions_and_probabilities(outputs, task_mode):
         return predictions, probabilities
 
     raise ValueError(f"不支持的任务模式: {task_mode}")
+
+
+def build_single_prediction_result(
+    predictions,
+    probability_matrix,
+    outputs,
+    task_mode,
+    subtype_names,
+):
+    """构造单例推理结果，并明确区分双头硬决策与概率诊断量。"""
+    predicted_label = predictions.item()
+    result = {
+        "predicted_subtype": subtype_names[predicted_label],
+        "predicted_label": predicted_label,
+    }
+
+    if task_mode in {"flat4", "flat5"}:
+        result["probabilities"] = {
+            name: float(probability_matrix[0, index])
+            for index, name in enumerate(subtype_names)
+        }
+        return result
+
+    if task_mode == "dual_head":
+        malignancy_probabilities = torch.softmax(
+            outputs["malignancy_logits"],
+            dim=1,
+        )
+        subtype_probabilities = torch.softmax(outputs["subtype_logits"], dim=1)
+        result.update(
+            {
+                "decision_rule": "采用良恶性头的硬门控：判为良性时输出良性，否则输出亚型头最大类别。",
+                "malignancy_probabilities": {
+                    "良性": float(malignancy_probabilities[0, 0]),
+                    "恶性": float(malignancy_probabilities[0, 1]),
+                },
+                "conditional_subtype_probabilities": {
+                    name: float(subtype_probabilities[0, index])
+                    for index, name in enumerate(subtype_names[:4])
+                },
+                "joint_probabilities": {
+                    name: float(probability_matrix[0, index])
+                    for index, name in enumerate(subtype_names)
+                },
+            }
+        )
+        return result
+
+    raise ValueError(f"不支持的任务模式: {task_mode}")
+
+
+def resolve_metadata_file(task_mode, metadata_file=None):
+    """按任务模式解析元数据文件，显式传入值保持不变。"""
+    if task_mode not in {"flat4", "flat5", "dual_head"}:
+        raise ValueError(f"不支持的任务模式: {task_mode}")
+    if metadata_file is not None:
+        return metadata_file
+    return "metadata.csv" if task_mode == "flat4" else "metadata_5class.csv"
 
 
 def _extract_state_dict(checkpoint):
@@ -86,17 +148,19 @@ def load_stage2_checkpoint(model, checkpoint_path, device):
     except RuntimeError as exc:
         raise ValueError("检查点参数形状不匹配，无法加载结构化任务接口") from exc
 
-    if any(key.startswith("task_heads.") for key in incompatible.missing_keys):
-        raise ValueError("当前模型缺少检查点要求的任务头参数")
-    if any(key.startswith("mlp_head.") for key in incompatible.unexpected_keys):
-        raise ValueError("检查点包含旧版 mlp_head 分类头，无法用于结构化任务接口")
+    if incompatible.missing_keys:
+        raise ValueError("检查点缺失当前模型所需参数")
+    if incompatible.unexpected_keys:
+        raise ValueError("检查点包含未预期参数")
 
     print(f"已加载结构化 Stage 2 检查点: {checkpoint_path}")
 
 
 @torch.no_grad()
 def predict_batch(model, dataloader, device, task_mode):
-    """对数据集执行批量推理，返回预测结果与标签。
+    """对数据集执行批量推理，返回硬预测、标签与概率诊断量。
+
+    双头模式的概率矩阵为联合诊断量，硬预测仍由良恶性头门控。
 
     Args:
         model: SECSubtypingModel 模型
@@ -107,7 +171,7 @@ def predict_batch(model, dataloader, device, task_mode):
     Returns:
         preds: (N,) 预测标签数组
         labels: (N,) 真实标签数组
-        probs: (N, C) 预测概率数组
+        probs: (N, C) 概率诊断量数组
     """
     model.eval()
     all_preds = []
@@ -144,7 +208,10 @@ def predict_single(
     max_text_len=128,
     subtype_names=None,
 ):
-    """对单个病例进行亚型预测。
+    """对单个病例进行任务感知预测。
+
+    双头模式返回硬门控决策与分开的条件、联合概率，避免将联合概率
+    误解为硬预测依据。
 
     Args:
         model: SECSubtypingModel 模型
@@ -158,7 +225,7 @@ def predict_single(
         max_text_len: 文本最大长度，默认 128
 
     Returns:
-        包含 predicted_subtype, predicted_label, probabilities 的结果字典
+        包含任务感知预测结果的字典
     """
     from PIL import Image
     from torchvision import transforms
@@ -189,7 +256,7 @@ def predict_single(
     cdfi_tensor = normalize_3ch(to_tensor(resize(cdfi_img)))  # (3, H, W)
 
     # 加载临床文本并进行 tokenization
-    with open(text_path) as f:
+    with open(text_path, encoding="utf-8") as f:
         text_data = json.load(f)
     raw_text = text_data.get("raw_text", "")
     encoding = tokenizer(raw_text, max_length=max_text_len, padding="max_length", truncation=True, return_tensors="pt")
@@ -205,18 +272,17 @@ def predict_single(
     with torch.no_grad():
         outputs = model(bus_tensor, swe_tensor, cdfi_tensor, input_ids, attention_mask)
         predictions, probabilities = task_predictions_and_probabilities(outputs, task_mode)
-        probs = probabilities.cpu().squeeze(0)
 
-    pred_class = predictions.item()
     names = subtype_names or (
         SUBTYPE_NAMES_4 if task_mode == "flat4" else SUBTYPE_NAMES_5
     )
-    result = {
-        "predicted_subtype": names[pred_class],
-        "predicted_label": pred_class,
-        "probabilities": {name: float(probs[i]) for i, name in enumerate(names)},
-    }
-    return result
+    return build_single_prediction_result(
+        predictions,
+        probabilities,
+        outputs,
+        task_mode,
+        names,
+    )
 
 
 def main(args):
@@ -247,9 +313,13 @@ def main(args):
 
     elif args.mode == "batch":
         # 批量评估模式
+        metadata_file = resolve_metadata_file(
+            args.task_mode,
+            args.metadata_file,
+        )
         dataset = MultiModalBreastDataset(
             root_dir=PROJECT_ROOT, split=args.split, img_size=args.img_size,
-            metadata_file=args.metadata_file,
+            metadata_file=metadata_file,
         )
         loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
@@ -298,8 +368,12 @@ if __name__ == "__main__":
         choices=["flat4", "flat5", "dual_head"],
         help="任务模式：flat4、flat5 或 dual_head",
     )
-    parser.add_argument("--metadata_file", type=str, default="metadata.csv",
-                        help="元数据文件名 (4分类用 metadata.csv, 5分类用 metadata_5class.csv)")
+    parser.add_argument(
+        "--metadata_file",
+        type=str,
+        default=None,
+        help="元数据文件名；默认 flat4 使用 metadata.csv，flat5 和 dual_head 使用 metadata_5class.csv",
+    )
     parser.add_argument("--split", type=str, default="test",
                         help="批量模式下的数据集划分，默认 test")
     parser.add_argument("--img_size", type=int, default=224, help="输入图像尺寸")
