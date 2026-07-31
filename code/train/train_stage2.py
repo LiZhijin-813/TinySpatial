@@ -4,6 +4,7 @@ import argparse
 import datetime
 import json
 import math
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -52,12 +53,53 @@ MONITOR_METRICS = (
 )
 
 
+def _translate_argparse_error(message):
+    """翻译 argparse 常见错误，同时保留参数和值线索。"""
+    invalid_choice = re.fullmatch(
+        r"argument (?P<argument>\S+): invalid choice: "
+        r"(?P<value>.+?) \(choose from (?P<choices>.+)\)",
+        message,
+    )
+    if invalid_choice:
+        return (
+            f"参数 {invalid_choice['argument']} 的值 "
+            f"{invalid_choice['value']} 无效，"
+            f"允许值：{invalid_choice['choices']}"
+        )
+
+    required_prefix = "the following arguments are required: "
+    if message.startswith(required_prefix):
+        return f"缺少必需参数：{message[len(required_prefix):]}"
+
+    unrecognized_prefix = "unrecognized arguments: "
+    if message.startswith(unrecognized_prefix):
+        return f"无法识别参数：{message[len(unrecognized_prefix):]}"
+
+    invalid_value = re.fullmatch(
+        r"argument (?P<argument>\S+): invalid (?P<kind>\S+) value: "
+        r"(?P<value>.+)",
+        message,
+    )
+    if invalid_value:
+        kind_names = {
+            "int": "整数",
+            "float": "浮点数",
+        }
+        kind = kind_names.get(invalid_value["kind"], "指定类型")
+        return (
+            f"参数 {invalid_value['argument']} 的值 "
+            f"{invalid_value['value']} 不是有效{kind}"
+        )
+
+    return "请检查参数名称、取值和格式"
+
+
 class ChineseArgumentParser(argparse.ArgumentParser):
     """将命令行解析失败统一转换为中文提示。"""
 
     def error(self, message):
         """以中文参数错误结束解析。"""
-        self.exit(2, f"参数错误：{message}\n")
+        self.exit(2, f"参数错误：{_translate_argparse_error(message)}\n")
 
 
 def build_parser():
@@ -840,6 +882,16 @@ def main(args):
             "binary_val": binary_val_metrics,
             "score": score,
         })
+        if (
+            args.task_mode == "overfit"
+            and not math.isfinite(float(train_metrics["total_loss"]))
+        ):
+            enforce_overfit_gate(
+                output_dir,
+                args.overfit_samples,
+                history,
+                last_val_metrics,
+            )
 
         if score > best_score:
             best_score = score

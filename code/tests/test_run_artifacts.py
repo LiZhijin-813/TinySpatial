@@ -295,7 +295,7 @@ def test_overfit_cli_accepts_both_no_augment_spellings(flag):
 
 
 def test_cli_reports_invalid_arguments_in_chinese(capsys):
-    """非法命令行参数必须只暴露可读中文错误。"""
+    """非法 choice 必须翻译正文并保留参数、非法值和允许值。"""
     parser = build_parser()
 
     with pytest.raises(SystemExit):
@@ -311,6 +311,57 @@ def test_cli_reports_invalid_arguments_in_chinese(capsys):
     assert "error:" not in stderr
     assert "--task_mode" in stderr
     assert "unknown" in stderr
+    assert "overfit" in stderr
+    assert "flat4" in stderr
+    assert "invalid choice" not in stderr
+    assert "choose from" not in stderr
+
+
+def test_cli_reports_missing_required_argument_in_chinese(capsys):
+    """缺少必需参数必须使用中文正文并保留参数名。"""
+    parser = build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args([])
+
+    stderr = capsys.readouterr().err
+    assert "参数错误" in stderr
+    assert "缺少必需参数" in stderr
+    assert "--pretrained_path" in stderr
+    assert "required" not in stderr
+
+
+@pytest.mark.parametrize(
+    "arguments, expected_fragments, forbidden_fragment",
+    [
+        (
+            ["--pretrained_path", "TinyUSFM.pth", "--unknown", "value"],
+            ["无法识别参数", "--unknown", "value"],
+            "unrecognized arguments",
+        ),
+        (
+            ["--pretrained_path", "TinyUSFM.pth", "--epochs", "many"],
+            ["--epochs", "many", "有效整数"],
+            "invalid int value",
+        ),
+    ],
+)
+def test_cli_translates_other_common_argument_errors(
+    capsys,
+    arguments,
+    expected_fragments,
+    forbidden_fragment,
+):
+    """未知参数和数值类型错误也必须保留中文线索。"""
+    parser = build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(arguments)
+
+    stderr = capsys.readouterr().err
+    for fragment in expected_fragments:
+        assert fragment in stderr
+    assert forbidden_fragment not in stderr
 
 
 @pytest.mark.parametrize(
@@ -731,4 +782,98 @@ def test_overfit_gate_failure_is_persisted_before_runtime_error(tmp_path):
         "prediction_distribution": [8, 8, 8, 8],
     }
     assert "NaN" not in raw
+    _assert_chinese_value_error(error)
+
+
+class _MainLoopOverfitDataset(torch.utils.data.Dataset):
+    def __init__(self, project_root, samples, img_size):
+        self.samples = [dict(sample) for sample in samples]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        sample = self.samples[index]
+        return {
+            "case_id": sample["case_id"],
+            "bus_img": torch.zeros(1, 2, 2),
+            "subtype_label": sample["subtype_label"],
+        }
+
+
+def test_main_persists_failed_gate_before_strict_history_rejects_nan(
+    tmp_path,
+    monkeypatch,
+):
+    """主循环遇到 NaN 损失时必须先写失败门禁，再抛门禁异常。"""
+    samples = [
+        {
+            "case_id": f"{label}-{index}",
+            "class_label": label,
+            "malignancy_label": 1,
+            "subtype_label": label,
+            "split": "train",
+            "source": "malignant",
+        }
+        for label in range(4)
+        for index in range(8)
+    ]
+    monkeypatch.setattr(
+        train_stage2_module,
+        "build_fair_splits",
+        lambda *args, **kwargs: {"train": samples},
+    )
+    monkeypatch.setattr(
+        train_stage2_module,
+        "BUSOverfitDataset",
+        _MainLoopOverfitDataset,
+    )
+    monkeypatch.setattr(
+        train_stage2_module,
+        "build_model",
+        lambda args, device: nn.Linear(1, 1).to(device),
+    )
+    monkeypatch.setattr(
+        train_stage2_module,
+        "train_one_epoch",
+        lambda *args, **kwargs: {
+            "total_loss": float("nan"),
+            "accuracy": 1.0,
+        },
+    )
+    monkeypatch.setattr(
+        train_stage2_module,
+        "evaluate_loader",
+        lambda *args, **kwargs: {
+            "malignant": {
+                "prediction_distribution": [8, 8, 8, 8],
+            }
+        },
+    )
+    args = build_parser().parse_args([
+        "--pretrained_path",
+        "TinyUSFM.pth",
+        "--task_mode",
+        "overfit",
+        "--epochs",
+        "1",
+        "--num_workers",
+        "0",
+        "--output_root",
+        str(tmp_path),
+    ])
+
+    with pytest.raises(RuntimeError) as error:
+        train_stage2_module.main(args)
+
+    run_dirs = list(tmp_path.glob("overfit_*"))
+    assert len(run_dirs) == 1
+    gate_path = run_dirs[0] / "overfit_gate.json"
+    payload = json.loads(gate_path.read_text(encoding="utf-8"))
+    assert payload["passed"] is False
+    assert payload["sample_count"] == 32
+    assert payload["final_accuracy"] == 1.0
+    assert payload["final_total_loss"] == "nan"
+    assert payload["prediction_distribution"] == [8, 8, 8, 8]
+    assert not (run_dirs[0] / "history.json").exists()
     _assert_chinese_value_error(error)
