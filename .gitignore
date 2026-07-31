@@ -1,6 +1,9 @@
 # Model checkpoints (too large for GitHub, each >100MB)
 checkpoints/
 
+# 本地实验运行产物
+runs/
+
 # Python cache
 __pycache__/
 *.pyc

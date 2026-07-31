@@ -1,439 +1,865 @@
-"""Stage 2 训练脚本：SEC-Subtyping 微调训练。
+"""Stage 2 可靠基线、过拟合门禁与检查点复评统一入口。"""
 
-保守微调策略（防止特征坍缩）：
-    - 冻结编码器大部分层，仅解冻最后 2 层 + norm + patch_embed
-    - 新组件（head/cross_attn/cdfi/ip_adapter）较高学习率，编码器低学习率
-    - CE + 类别逆频率权重 + 轻度 label_smoothing，对抗类别不平衡
-    - 特征多样性正则：惩罚 F_bus_swe 跨样本方差过小，强制编码器产出差异化特征
-    - 梯度累积模拟更大 batch size，稳定梯度估计
-    - 先关闭 CAM 对齐损失（beta=0），待分类有效后再开启
-"""
-import os
-import sys
 import argparse
-import time
 import datetime
 import json
 import math
+import sys
+from collections import Counter
+from pathlib import Path
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-import numpy as np
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 if "code" in sys.modules and not hasattr(sys.modules["code"], "__path__"):
     del sys.modules["code"]
 
-from code.utils.seed import seed_everything
+from code.datasets.bus_dataset import BUSOverfitDataset
 from code.datasets.dataset import MultiModalBreastDataset
+from code.datasets.split_utils import (
+    build_fair_splits,
+    build_split_manifest,
+    select_balanced_subset,
+    select_samples_by_case_ids,
+)
+from code.models.stage2.overfit_probe import BUSOverfitProbe
 from code.models.stage2.subtyping_model import SECSubtypingModel
-from code.models.stage2.cam import ContrastiveAlignmentModule
+from code.train.run_artifacts import (
+    initialize_run_artifacts,
+    save_json,
+    save_training_state,
+)
+from code.train.stage2_engine import (
+    evaluate_loader,
+    monitor_value,
+    train_one_epoch,
+)
+from code.train.stage2_objectives import compute_class_weights
+from code.utils.seed import seed_everything
 
 
-def compute_class_weights(dataset, num_classes=4, device="cpu"):
-    """根据训练集类别逆频率计算 CrossEntropyLoss 的权重向量。"""
-    from collections import Counter
-    labels = [s["subtype_label"] for s in dataset.samples]
-    counts = Counter(labels)
-    total = len(labels)
-    weights = torch.zeros(num_classes, device=device)
-    for c in range(num_classes):
-        freq = counts.get(c, 1) / total
-        weights[c] = 1.0 / (freq * num_classes)  # 逆频率归一化，使均值为1
-    return weights
+TASK_MODES = ("overfit", "flat4", "flat5", "dual_head")
+MONITOR_METRICS = (
+    "malignant_macro_f1",
+    "macro_f1",
+    "balanced_acc",
+    "acc",
+)
 
 
-def build_optimizer(model, cam, base_lr, weight_decay):
-    """构建 AdamW 优化器，分层学习率衰减。"""
-    param_groups = []
-    depth = len(model.encoder.blocks)
-    unfreeze_last_n = 0
-    # 检测实际解冻了多少层
-    for i in range(depth):
-        if any(p.requires_grad for p in model.encoder.blocks[i].parameters()):
-            unfreeze_last_n = depth - i
-            break
+class ChineseArgumentParser(argparse.ArgumentParser):
+    """将命令行解析失败统一转换为中文提示。"""
 
-    # 新组件: 适中的学习率（避免 head 先于编码器收敛到退化解）
-    param_groups.append({
-        "params": model.mlp_head.parameters(),
-        "lr": base_lr * 3,
-        "weight_decay": 0.01,
-        "name": "mlp_head",
-    })
-    param_groups.append({
-        "params": model.ip_adapters.parameters(),
-        "lr": base_lr * 2,
-        "weight_decay": weight_decay,
-        "name": "ip_adapter",
-    })
-    param_groups.append({
-        "params": model.cross_attention.parameters(),
-        "lr": base_lr * 2,
-        "weight_decay": weight_decay,
-        "name": "cross_attention",
-    })
-    param_groups.append({
-        "params": model.cdfi_branch.parameters(),
-        "lr": base_lr * 2,
-        "weight_decay": weight_decay,
-        "name": "cdfi_branch",
-    })
-
-    # 编码器: 仅解冻层使用低学习率，冻结层跳过
-    for i, blk in enumerate(model.encoder.blocks):
-        trainable_params = [p for p in blk.parameters() if p.requires_grad]
-        if trainable_params:
-            param_groups.append({
-                "params": trainable_params,
-                "lr": base_lr,
-                "weight_decay": weight_decay,
-                "name": f"encoder_block_{i}",
-            })
-
-    # Patch embed + norm
-    enc_params = [p for p in (
-        list(model.encoder.patch_embed.parameters()) + list(model.encoder.norm.parameters())
-    ) if p.requires_grad]
-    if enc_params:
-        param_groups.append({
-            "params": enc_params,
-            "lr": base_lr,
-            "weight_decay": weight_decay,
-            "name": "patch_embed_norm",
-        })
-
-    # 文本分支投影层（BERT 冻结，仅投影层可训练）
-    text_proj_params = [p for n, p in model.text_branch.named_parameters() if p.requires_grad]
-    if text_proj_params:
-        param_groups.append({
-            "params": text_proj_params,
-            "lr": base_lr * 2,
-            "weight_decay": weight_decay,
-            "name": "text_proj",
-        })
-
-    # CAM
-    param_groups.append({
-        "params": cam.parameters(),
-        "lr": base_lr * 2,
-        "weight_decay": weight_decay,
-        "name": "cam",
-    })
-
-    return torch.optim.AdamW(param_groups)
+    def error(self, message):
+        """以中文参数错误结束解析。"""
+        del message
+        self.exit(2, "参数错误：请检查参数名称、取值和格式。\n")
 
 
-def train_one_epoch(model, cam, dataloader, optimizer, cls_criterion, device, epoch,
-                    alpha, beta, gamma, max_grad_norm, accum_steps):
-    """执行一个 epoch 的训练。
-
-    Args:
-        gamma: 特征多样性正则权重。当 F_bus_swe 跨 batch 方差低于阈值时施加惩罚。
-        accum_steps: 梯度累积步数，模拟更大的 effective batch size。
-    """
-    model.train()
-    cam.train()
-    total_loss_sum = 0.0
-    cls_loss_sum = 0.0
-    align_loss_sum = 0.0
-    diversity_loss_sum = 0.0
-    correct = 0
-    total = 0
-
-    optimizer.zero_grad()
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
-    for step, batch in enumerate(pbar):
-        bus_img = batch["bus_img"].to(device)
-        swe_img = batch["swe_img"].to(device)
-        cdfi_img = batch["cdfi_img"].to(device)
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["subtype_label"].to(device)
-
-        logits, F_bus_swe, F_text = model(bus_img, swe_img, cdfi_img, input_ids, attention_mask)
-
-        cls_loss = cls_criterion(logits, labels)
-        if beta > 0:
-            align_loss, _, _ = cam(F_bus_swe, F_text)
-        else:
-            align_loss = torch.tensor(0.0, device=device)
-
-        # 特征多样性正则：惩罚 F_bus_swe 跨样本方差过小
-        # 方差越大说明特征越有区分度，我们希望方差不低于 min_var
-        if gamma > 0 and F_bus_swe.shape[0] > 1:
-            feat_var = F_bus_swe.var(dim=0).mean()
-            min_var = 0.01  # 期望的特征方差下界
-            diversity_loss = F.relu(min_var - feat_var)  # 仅在方差不足时惩罚
-        else:
-            diversity_loss = torch.tensor(0.0, device=device)
-
-        loss = alpha * cls_loss + beta * align_loss + gamma * diversity_loss
-        loss = loss / accum_steps  # 缩放以配合梯度累积
-
-        loss.backward()
-
-        if (step + 1) % accum_steps == 0 or (step + 1) == len(dataloader):
-            if max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad] + list(cam.parameters()),
-                    max_grad_norm,
-                )
-            optimizer.step()
-            optimizer.zero_grad()
-
-        total_loss_sum += loss.item() * accum_steps
-        cls_loss_sum += cls_loss.item()
-        align_loss_sum += align_loss.item()
-        diversity_loss_sum += diversity_loss.item()
-
-        pred = logits.argmax(dim=1)
-        correct += (pred == labels).sum().item()
-        total += labels.shape[0]
-
-        pbar.set_postfix(
-            loss=f"{cls_loss.item():.4f}",
-            div=f"{diversity_loss.item():.4f}",
-            acc=f"{correct/total:.3f}",
-        )
-
-    return {
-        "total_loss": total_loss_sum / len(dataloader),
-        "cls_loss": cls_loss_sum / len(dataloader),
-        "align_loss": align_loss_sum / len(dataloader),
-        "diversity_loss": diversity_loss_sum / len(dataloader),
-        "acc": correct / max(total, 1),
-    }
-
-
-@torch.no_grad()
-def validate(model, cam, dataloader, cls_criterion, device, alpha, beta, num_classes=4):
-    """在验证集上评估模型性能。"""
-    model.eval()
-    cam.eval()
-    total_loss_sum = 0.0
-    cls_loss_sum = 0.0
-    all_preds = []
-    all_labels = []
-    all_logits = []
-    all_feat_var = []
-
-    for batch in dataloader:
-        bus_img = batch["bus_img"].to(device)
-        swe_img = batch["swe_img"].to(device)
-        cdfi_img = batch["cdfi_img"].to(device)
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["subtype_label"].to(device)
-
-        logits, F_bus_swe, F_text = model(bus_img, swe_img, cdfi_img, input_ids, attention_mask)
-        cls_loss = cls_criterion(logits, labels)
-        if beta > 0:
-            align_loss, _, _ = cam(F_bus_swe, F_text)
-        else:
-            align_loss = torch.tensor(0.0, device=device)
-
-        loss = alpha * cls_loss + beta * align_loss
-        total_loss_sum += loss.item()
-        cls_loss_sum += cls_loss.item()
-
-        all_preds.extend(logits.argmax(dim=1).cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
-        all_logits.append(logits.cpu())
-        all_feat_var.append(F_bus_swe.var(dim=0).mean().item())
-
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-    acc = (all_preds == all_labels).mean()
-
-    pred_dist = np.bincount(all_preds, minlength=num_classes)
-    label_dist = np.bincount(all_labels, minlength=num_classes)
-
-    # 特征坍缩检测：logits 方差和 F_bus_swe 方差
-    all_logits = torch.cat(all_logits, dim=0)
-    logits_var = all_logits.var(dim=0).mean().item()
-    feat_var = np.mean(all_feat_var)
-
-    return {
-        "total_loss": total_loss_sum / len(dataloader),
-        "cls_loss": cls_loss_sum / len(dataloader),
-        "acc": acc,
-        "preds": all_preds,
-        "labels": all_labels,
-        "pred_dist": pred_dist.tolist(),
-        "label_dist": label_dist.tolist(),
-        "logits_var": logits_var,
-        "feat_var": feat_var,
-    }
-
-
-class LinearWarmupCosineScheduler:
-    """线性 warmup + 余弦退火学习率调度器。"""
-
-    def __init__(self, optimizer, warmup_epochs, total_epochs):
-        self.optimizer = optimizer
-        self.warmup_epochs = warmup_epochs
-        self.total_epochs = total_epochs
-        self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
-
-    def step(self, epoch):
-        if epoch < self.warmup_epochs:
-            scale = (epoch + 1) / self.warmup_epochs
-        else:
-            progress = (epoch - self.warmup_epochs) / max(1, self.total_epochs - self.warmup_epochs)
-            scale = 0.5 * (1.0 + math.cos(math.pi * progress))
-
-        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
-            pg["lr"] = base_lr * scale
-
-    def get_last_lr(self):
-        return [pg["lr"] for pg in self.optimizer.param_groups]
-
-
-def main(args):
-    """Stage 2 端到端训练主函数。"""
-    seed_everything(args.seed)
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_dir = os.path.join(PROJECT_ROOT, "checkpoints", f"stage2_{timestamp}")
-    os.makedirs(output_dir, exist_ok=True)
-
-    # 加载数据集
-    train_ds = MultiModalBreastDataset(
-        root_dir=PROJECT_ROOT, split="train", img_size=args.img_size, max_text_len=args.max_text_len,
-        metadata_file=args.metadata_file,
+def build_parser():
+    """构建可靠 Stage 2 训练与复评命令行解析器。"""
+    parser = ChineseArgumentParser(description="Stage 2 可靠基线训练")
+    parser.add_argument("--pretrained_path", required=True, help="预训练权重路径")
+    parser.add_argument(
+        "--task_mode",
+        choices=TASK_MODES,
+        default="flat4",
+        help="训练任务模式",
     )
-    val_ds = MultiModalBreastDataset(
-        root_dir=PROJECT_ROOT, split="val", img_size=args.img_size, max_text_len=args.max_text_len,
-        metadata_file=args.metadata_file,
+    parser.add_argument(
+        "--malignant_metadata",
+        default="metadata.csv",
+        help="恶性病例元数据文件名",
     )
-
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
-
-    # 初始化模型 — 保守微调：仅解冻编码器最后 2 层
-    model = SECSubtypingModel(
-        pretrained_path=args.pretrained_path,
-        num_classes=args.num_classes,
-        img_size=args.img_size,
-        unfreeze_last_n=args.unfreeze,
-    ).to(device)
-
-    # CAM 对比对齐模块
-    cam = ContrastiveAlignmentModule(
-        image_dim=192, text_dim=512, proj_dim=512, temperature=args.tau,
-    ).to(device)
-
-    # CE + 类别逆频率权重 + 轻度 label_smoothing，对抗类别不平衡
-    class_weights = compute_class_weights(train_ds, num_classes=args.num_classes, device=device)
-    print(f"类别权重: {class_weights.tolist()}")
-    cls_criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
-
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_p = sum(p.numel() for p in model.parameters())
-    print(f"模型参数量: {total_p/1e6:.2f}M, 可训练: {trainable/1e6:.2f}M")
-    print(f"学习率: {args.lr}, warmup: {args.warmup}, beta: {args.beta}, gamma: {args.gamma}")
-    print(f"解冻编码器层数: {args.unfreeze}, 梯度累积: {args.accum_steps} (effective_bs={args.batch_size * args.accum_steps})")
-
-    optimizer = build_optimizer(model, cam, args.lr, args.wd)
-    scheduler = LinearWarmupCosineScheduler(optimizer, warmup_epochs=args.warmup, total_epochs=args.epochs)
-
-    best_val_acc = 0.0
-    patience_counter = 0
-    history = []
-
-    for epoch in range(1, args.epochs + 1):
-        t0 = time.time()
-        scheduler.step(epoch - 1)
-
-        train_metrics = train_one_epoch(
-            model, cam, train_loader, optimizer, cls_criterion, device, epoch,
-            args.alpha, args.beta, args.gamma, args.max_grad_norm, args.accum_steps,
-        )
-        val_metrics = validate(
-            model, cam, val_loader, cls_criterion, device, args.alpha, args.beta,
-            num_classes=args.num_classes,
-        )
-        elapsed = time.time() - t0
-
-        lrs = scheduler.get_last_lr()
-        lr_str = f"lr={lrs[0]:.2e}"
-
-        print(
-            f"Epoch {epoch}/{args.epochs} | "
-            f"train_loss={train_metrics['cls_loss']:.4f} train_acc={train_metrics['acc']:.3f} | "
-            f"val_loss={val_metrics['cls_loss']:.4f} val_acc={val_metrics['acc']:.3f} | "
-            f"pred={val_metrics['pred_dist']} | "
-            f"logits_var={val_metrics['logits_var']:.4f} feat_var={val_metrics['feat_var']:.6f} | "
-            f"div_loss={train_metrics['diversity_loss']:.4f} | "
-            f"{lr_str} {elapsed:.1f}s"
-        )
-
-        history.append({
-            "epoch": epoch,
-            "train": train_metrics,
-            "val": {k: v for k, v in val_metrics.items() if k not in ("preds", "labels")},
-            "lr": lrs,
-        })
-
-        if val_metrics["acc"] > best_val_acc:
-            best_val_acc = val_metrics["acc"]
-            patience_counter = 0
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "cam_state_dict": cam.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_acc": val_metrics["acc"],
-            }, os.path.join(output_dir, "best_model.pth"))
-            print(f"  -> 保存最佳模型 (val_acc={val_metrics['acc']:.4f})")
-        else:
-            patience_counter += 1
-            if patience_counter >= args.patience:
-                print(f"Early stopping: 连续 {args.patience} 个 epoch 无改善，于 epoch {epoch} 停止")
-                break
-
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "cam_state_dict": cam.state_dict(),
-    }, os.path.join(output_dir, "final_model.pth"))
-
-    with open(os.path.join(output_dir, "history.json"), "w") as f:
-        json.dump(history, f, indent=2)
-
-    print(f"\n训练完成。最佳 val_acc={best_val_acc:.4f}")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stage 2 SEC-Subtyping 端到端训练")
-    parser.add_argument("--pretrained_path", type=str, required=True,
-                        help="Stage 1 ACM-MIM 预训练权重路径")
-    parser.add_argument("--metadata_file", type=str, default="metadata.csv",
-                        help="元数据文件名 (4分类用 metadata.csv, 5分类用 metadata_5class.csv)")
-    parser.add_argument("--num_classes", type=int, default=4, help="分类类别数 (4 或 5)")
+    parser.add_argument(
+        "--benign_metadata",
+        default="metadata_5class.csv",
+        help="含良性病例的元数据文件名",
+    )
+    parser.add_argument(
+        "--overfit_samples",
+        type=int,
+        choices=[32, 64],
+        default=32,
+        help="过拟合门禁样本数",
+    )
+    parser.add_argument(
+        "--lambda_bm",
+        type=float,
+        default=0.3,
+        help="双头良恶性损失固定权重",
+    )
+    parser.add_argument(
+        "--sampler",
+        choices=["none", "balanced"],
+        default="none",
+        help="训练采样策略",
+    )
+    parser.add_argument(
+        "--monitor_metric",
+        choices=MONITOR_METRICS,
+        default="malignant_macro_f1",
+        help="模型选择监控指标",
+    )
+    parser.add_argument(
+        "--eval_malignant_subset",
+        dest="eval_malignant_subset",
+        action="store_true",
+        help="评估固定恶性子集",
+    )
+    parser.add_argument(
+        "--no_eval_malignant_subset",
+        "--no-eval-malignant-subset",
+        dest="eval_malignant_subset",
+        action="store_false",
+        help="不评估固定恶性子集",
+    )
+    parser.add_argument("--evaluate_checkpoint", help="仅复评指定检查点")
+    parser.add_argument(
+        "--eval_output",
+        default="metrics_eval.json",
+        help="检查点复评指标输出路径",
+    )
+    parser.add_argument(
+        "--augment",
+        dest="augment",
+        action="store_true",
+        help="启用训练增强",
+    )
+    parser.add_argument(
+        "--no_augment",
+        "--no-augment",
+        dest="augment",
+        action="store_false",
+        help="禁用训练增强",
+    )
+    parser.add_argument(
+        "--label_smoothing",
+        type=float,
+        default=0.0,
+        help="标签平滑系数，可靠基线固定为零",
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=0.0,
+        help="对齐损失权重，可靠基线固定为零",
+    )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=0.0,
+        help="特征正则权重，可靠基线固定为零",
+    )
     parser.add_argument("--img_size", type=int, default=224, help="输入图像尺寸")
     parser.add_argument("--batch_size", type=int, default=8, help="批次大小")
     parser.add_argument("--epochs", type=int, default=100, help="训练轮数")
     parser.add_argument("--lr", type=float, default=5e-4, help="基础学习率")
     parser.add_argument("--wd", type=float, default=0.05, help="权重衰减")
-    parser.add_argument("--warmup", type=int, default=5, help="线性 warmup epoch 数")
-    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="梯度裁剪阈值")
-    parser.add_argument("--alpha", type=float, default=1.0, help="L_cls 权重系数")
-    parser.add_argument("--beta", type=float, default=0.0, help="L_align 权重系数 (0=关闭)")
-    parser.add_argument("--gamma", type=float, default=1.0, help="特征多样性正则权重 (0=关闭)")
-    parser.add_argument("--tau", type=float, default=0.07, help="CAM 温度参数 τ")
-    parser.add_argument("--unfreeze", type=int, default=2, help="解冻编码器最后 N 层")
-    parser.add_argument("--accum_steps", type=int, default=4, help="梯度累积步数 (effective_bs=batch_size*accum_steps)")
-    parser.add_argument("--patience", type=int, default=20, help="Early stopping 耐心值")
-    parser.add_argument("--max_text_len", type=int, default=128, help="文本最大长度")
-    parser.add_argument("--num_workers", type=int, default=4, help="数据加载线程数")
+    parser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=1.0,
+        help="梯度裁剪阈值",
+    )
+    parser.add_argument(
+        "--accum_steps",
+        type=int,
+        default=1,
+        help="梯度累积步数",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=20,
+        help="提前停止耐心轮数",
+    )
+    parser.add_argument(
+        "--max_text_len",
+        type=int,
+        default=128,
+        help="文本最大长度",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=4,
+        help="数据加载进程数",
+    )
+    parser.add_argument(
+        "--unfreeze",
+        type=int,
+        default=2,
+        help="解冻编码器末尾层数",
+    )
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
-    parser.add_argument("--device", type=str, default="cuda:0", help="计算设备")
-    args = parser.parse_args()
-    main(args)
+    parser.add_argument("--device", default="cuda:0", help="计算设备")
+    parser.add_argument(
+        "--output_root",
+        default="runs/stage2",
+        help="运行产物根目录",
+    )
+    parser.set_defaults(augment=None, eval_malignant_subset=True)
+    return parser
+
+
+def validate_reliable_configuration(args):
+    """拒绝改变可靠基线目标函数和模型选择口径的参数。"""
+    for name in ("beta", "gamma", "label_smoothing"):
+        if getattr(args, name) != 0.0:
+            raise ValueError(f"可靠基线要求 {name}=0，不允许启用额外损失")
+    if args.lambda_bm != 0.3:
+        raise ValueError("dual_head 的 lambda_bm 固定为 0.3")
+    if args.monitor_metric != "malignant_macro_f1":
+        raise ValueError(
+            "monitor_metric 仅允许 malignant_macro_f1，"
+            "其他指标只能作为诊断输出"
+        )
+    if args.task_mode != "overfit" and not args.eval_malignant_subset:
+        raise ValueError("可靠基线必须评估固定恶性子集")
+
+
+def build_criteria_for_mode(
+    task_mode,
+    samples,
+    device,
+    label_smoothing=0.0,
+):
+    """按任务标签空间构造彼此独立的交叉熵损失。"""
+    if task_mode == "overfit":
+        return {"class": nn.CrossEntropyLoss()}
+    if task_mode == "flat4":
+        weights = compute_class_weights(
+            samples,
+            "subtype_label",
+            4,
+            device=device,
+        )
+        return {
+            "class": nn.CrossEntropyLoss(
+                weight=weights,
+                label_smoothing=label_smoothing,
+            )
+        }
+    if task_mode == "flat5":
+        weights = compute_class_weights(
+            samples,
+            "class_label",
+            5,
+            device=device,
+        )
+        return {
+            "class": nn.CrossEntropyLoss(
+                weight=weights,
+                label_smoothing=label_smoothing,
+            )
+        }
+    if task_mode != "dual_head":
+        raise ValueError(f"未知 task_mode: {task_mode}")
+    return {
+        "malignancy": nn.CrossEntropyLoss(
+            weight=compute_class_weights(
+                samples,
+                "malignancy_label",
+                2,
+                device=device,
+            ),
+            label_smoothing=label_smoothing,
+        ),
+        "subtype": nn.CrossEntropyLoss(
+            weight=compute_class_weights(
+                samples,
+                "subtype_label",
+                4,
+                ignore_index=-1,
+                device=device,
+            ),
+            label_smoothing=label_smoothing,
+        ),
+    }
+
+
+def build_train_loader(dataset, task_mode, args):
+    """构建随机打乱或按当前任务标签逆频率采样的训练加载器。"""
+    sampler = None
+    if args.sampler == "balanced":
+        if task_mode == "overfit":
+            raise ValueError(
+                "过拟合门禁已经分层均衡，不允许重复使用 balanced sampler"
+            )
+        label_key = "subtype_label" if task_mode == "flat4" else "class_label"
+        counts = Counter(int(sample[label_key]) for sample in dataset.samples)
+        sample_weights = [
+            1.0 / counts[int(sample[label_key])]
+            for sample in dataset.samples
+        ]
+        sampler = WeightedRandomSampler(
+            sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+    return DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=sampler is None,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+
+
+def build_eval_loader(dataset, args):
+    """构建训练和检查点复评共用的确定性数据加载器。"""
+    return DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+
+
+def _append_parameter_group(
+    groups,
+    seen,
+    module,
+    name,
+    learning_rate,
+    weight_decay,
+):
+    """追加模块中尚未收集的可训练参数。"""
+    parameters = []
+    for parameter in module.parameters():
+        parameter_id = id(parameter)
+        if parameter.requires_grad and parameter_id not in seen:
+            seen.add(parameter_id)
+            parameters.append(parameter)
+    if parameters:
+        groups.append({
+            "params": parameters,
+            "lr": learning_rate,
+            "weight_decay": weight_decay,
+            "name": name,
+        })
+
+
+def build_optimizer(model, base_lr, weight_decay):
+    """按模块分组构建 AdamW，并验证可训练参数无遗漏、无重复。"""
+    groups = []
+    seen = set()
+    _append_parameter_group(
+        groups,
+        seen,
+        model.task_heads,
+        "task_heads",
+        base_lr * 3,
+        0.01,
+    )
+    _append_parameter_group(
+        groups,
+        seen,
+        model.ip_adapters,
+        "ip_adapters",
+        base_lr * 2,
+        weight_decay,
+    )
+    _append_parameter_group(
+        groups,
+        seen,
+        model.cross_attention,
+        "cross_attention",
+        base_lr * 2,
+        weight_decay,
+    )
+    _append_parameter_group(
+        groups,
+        seen,
+        model.cdfi_branch,
+        "cdfi_branch",
+        base_lr * 2,
+        weight_decay,
+    )
+    for index, block in enumerate(model.encoder.blocks):
+        _append_parameter_group(
+            groups,
+            seen,
+            block,
+            f"encoder_block_{index}",
+            base_lr,
+            weight_decay,
+        )
+
+    encoder_shell = nn.ModuleList([
+        model.encoder.patch_embed,
+        model.encoder.norm,
+    ])
+    _append_parameter_group(
+        groups,
+        seen,
+        encoder_shell,
+        "patch_embed_norm",
+        base_lr,
+        weight_decay,
+    )
+    _append_parameter_group(
+        groups,
+        seen,
+        model.text_branch,
+        "text_projection",
+        base_lr * 2,
+        weight_decay,
+    )
+
+    optimizer = torch.optim.AdamW(groups)
+    optimized_ids = [
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    expected = {
+        id(parameter)
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    }
+    if len(optimized_ids) != len(set(optimized_ids)):
+        raise RuntimeError("优化器参数组包含重复参数")
+    if set(optimized_ids) != expected:
+        raise RuntimeError("优化器参数组与可训练参数不一致")
+    return optimizer
+
+
+def build_model(args, device):
+    """按任务模式构造训练和复评共用模型。"""
+    if args.task_mode == "overfit":
+        model = BUSOverfitProbe(
+            pretrained_path=args.pretrained_path,
+            img_size=args.img_size,
+        )
+    else:
+        model = SECSubtypingModel(
+            pretrained_path=args.pretrained_path,
+            task_mode=args.task_mode,
+            img_size=args.img_size,
+            unfreeze_last_n=args.unfreeze,
+        )
+    return model.to(device)
+
+
+def restore_manifest_splits(canonical_splits, manifest):
+    """从 canonical 样本池按 manifest 名称和 case ID 顺序恢复划分。"""
+    candidates = []
+    seen = set()
+    for samples in canonical_splits.values():
+        for sample in samples:
+            if sample["case_id"] not in seen:
+                seen.add(sample["case_id"])
+                candidates.append(sample)
+    return {
+        name: select_samples_by_case_ids(candidates, case_ids)
+        for name, case_ids in manifest["splits"].items()
+    }
+
+
+def evaluate_checkpoint(args, device, canonical_splits):
+    """按检查点相邻配置和清单执行确定性复评。"""
+    checkpoint_path = Path(args.evaluate_checkpoint)
+    run_dir = checkpoint_path.parent
+    saved_args = json.loads(
+        (run_dir / "args.json").read_text(encoding="utf-8")
+    )
+    manifest = json.loads(
+        (run_dir / "split_manifest.json").read_text(encoding="utf-8")
+    )
+    saved_mode = saved_args.get("task_mode")
+    manifest_mode = manifest.get("task_mode")
+    if saved_mode != args.task_mode or manifest_mode != args.task_mode:
+        raise ValueError("复评 task_mode 与检查点训练模式或清单不一致")
+
+    restored = restore_manifest_splits(canonical_splits, manifest)
+    model_args = argparse.Namespace(**{**vars(args), **saved_args})
+    model = build_model(model_args, device)
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=False,
+    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    if args.task_mode == "overfit":
+        dataset = BUSOverfitDataset(
+            PROJECT_ROOT,
+            samples=restored["train"],
+            img_size=model_args.img_size,
+        )
+    else:
+        dataset = MultiModalBreastDataset(
+            PROJECT_ROOT,
+            split="test",
+            img_size=model_args.img_size,
+            max_text_len=model_args.max_text_len,
+            samples=restored["malignant_test"],
+            augment=False,
+        )
+    metrics = evaluate_loader(
+        model,
+        build_eval_loader(dataset, model_args),
+        args.task_mode,
+        device,
+        split_kind="malignant",
+    )
+    save_json(Path(args.eval_output), metrics)
+    return metrics
+
+
+def assert_overfit_gate(overfit_samples, history, val_metrics):
+    """检查最终训练准确率、损失有限性和四类预测完整性。"""
+    final_accuracy = history[-1]["train"]["accuracy"]
+    final_loss = history[-1]["train"]["total_loss"]
+    prediction_distribution = val_metrics["malignant"][
+        "prediction_distribution"
+    ]
+    passed = (
+        final_accuracy >= 0.98
+        and math.isfinite(final_loss)
+        and len(prediction_distribution) == 4
+        and all(count > 0 for count in prediction_distribution)
+    )
+    if not passed:
+        raise RuntimeError(
+            f"{overfit_samples} 例过拟合门禁失败："
+            f"Accuracy={final_accuracy:.4f}，"
+            f"loss={final_loss:.6f}，"
+            f"prediction_distribution={prediction_distribution}"
+        )
+
+
+def _multimodal_dataset(samples, split, args, augment=False):
+    """从显式样本清单创建多模态数据集。"""
+    return MultiModalBreastDataset(
+        PROJECT_ROOT,
+        split=split,
+        img_size=args.img_size,
+        max_text_len=args.max_text_len,
+        samples=samples,
+        augment=augment,
+    )
+
+
+def _build_evaluation_loaders(splits, args):
+    """构造当前任务适用的固定验证与测试加载器。"""
+    loaders = {
+        "malignant_val": build_eval_loader(
+            _multimodal_dataset(
+                splits["malignant_val"],
+                "val",
+                args,
+                augment=False,
+            ),
+            args,
+        ),
+        "malignant_test": build_eval_loader(
+            _multimodal_dataset(
+                splits["malignant_test"],
+                "test",
+                args,
+                augment=False,
+            ),
+            args,
+        ),
+    }
+    if args.task_mode in {"flat5", "dual_head"}:
+        loaders["binary_val"] = build_eval_loader(
+            _multimodal_dataset(
+                splits["binary_val"],
+                "val",
+                args,
+                augment=False,
+            ),
+            args,
+        )
+        loaders["binary_test"] = build_eval_loader(
+            _multimodal_dataset(
+                splits["binary_test"],
+                "test",
+                args,
+                augment=False,
+            ),
+            args,
+        )
+    return loaders
+
+
+def _checkpoint_payload(
+    model,
+    epoch,
+    monitor_metric,
+    score,
+    malignant_metrics,
+    binary_metrics,
+):
+    """构造可审计的最佳模型检查点。"""
+    return {
+        "model_state_dict": model.state_dict(),
+        "epoch": epoch,
+        "monitor_metric": monitor_metric,
+        "score": score,
+        "malignant_val": malignant_metrics,
+        "binary_val": binary_metrics,
+    }
+
+
+def _evaluate_test_sets(model, loaders, args, device):
+    """评估固定恶性测试集及适用的二分类测试集。"""
+    malignant = evaluate_loader(
+        model,
+        loaders["malignant_test"],
+        args.task_mode,
+        device,
+        split_kind="malignant",
+    )
+    binary = None
+    if args.task_mode in {"flat5", "dual_head"}:
+        binary = evaluate_loader(
+            model,
+            loaders["binary_test"],
+            args.task_mode,
+            device,
+            split_kind="binary",
+        )
+    return {"malignant": malignant, "binary": binary}
+
+
+def main(args):
+    """执行可靠基线训练、过拟合门禁或检查点确定性复评。"""
+    validate_reliable_configuration(args)
+    seed_everything(args.seed)
+    device = torch.device(
+        args.device if torch.cuda.is_available() else "cpu"
+    )
+    canonical_splits = build_fair_splits(
+        PROJECT_ROOT,
+        args.task_mode,
+        malignant_metadata=args.malignant_metadata,
+        benign_metadata=args.benign_metadata,
+    )
+    if args.evaluate_checkpoint:
+        return evaluate_checkpoint(
+            args,
+            device,
+            canonical_splits,
+        )
+
+    if args.task_mode == "overfit":
+        splits = {
+            "train": select_balanced_subset(
+                canonical_splits["train"],
+                per_class=args.overfit_samples // 4,
+                seed=args.seed,
+            )
+        }
+        augment = False
+    else:
+        splits = canonical_splits
+        augment = args.augment
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    output_dir = (
+        PROJECT_ROOT
+        / args.output_root
+        / f"{args.task_mode}_{timestamp}"
+    )
+    manifest = build_split_manifest(args.task_mode, splits, args.seed)
+    initialize_run_artifacts(output_dir, args, manifest)
+
+    if args.task_mode == "overfit":
+        train_dataset = BUSOverfitDataset(
+            PROJECT_ROOT,
+            samples=splits["train"],
+            img_size=args.img_size,
+        )
+        evaluation_loaders = {}
+    else:
+        train_dataset = _multimodal_dataset(
+            splits["train"],
+            "train",
+            args,
+            augment=augment,
+        )
+        evaluation_loaders = _build_evaluation_loaders(
+            splits,
+            args,
+        )
+
+    train_loader = build_train_loader(
+        train_dataset,
+        args.task_mode,
+        args,
+    )
+    model = build_model(args, device)
+    criteria = build_criteria_for_mode(
+        args.task_mode,
+        train_dataset.samples,
+        device,
+        label_smoothing=args.label_smoothing,
+    )
+    if args.task_mode == "overfit":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=0.0,
+        )
+    else:
+        optimizer = build_optimizer(model, args.lr, args.wd)
+
+    history = []
+    best_score = -math.inf
+    best_metrics = None
+    patience_counter = 0
+    last_val_metrics = None
+
+    for epoch in range(1, args.epochs + 1):
+        train_metrics = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criteria,
+            args.task_mode,
+            device,
+            lambda_bm=args.lambda_bm,
+            max_grad_norm=args.max_grad_norm,
+            accum_steps=args.accum_steps,
+        )
+        last_val_metrics = evaluate_loader(
+            model,
+            (
+                train_loader
+                if args.task_mode == "overfit"
+                else evaluation_loaders["malignant_val"]
+            ),
+            args.task_mode,
+            device,
+            split_kind="malignant",
+        )
+        binary_val_metrics = None
+        if args.task_mode in {"flat5", "dual_head"}:
+            binary_val_metrics = evaluate_loader(
+                model,
+                evaluation_loaders["binary_val"],
+                args.task_mode,
+                device,
+                split_kind="binary",
+            )
+        score = (
+            train_metrics["accuracy"]
+            if args.task_mode == "overfit"
+            else monitor_value(
+                last_val_metrics,
+                args.monitor_metric,
+            )
+        )
+        history.append({
+            "epoch": epoch,
+            "train": train_metrics,
+            "malignant_val": last_val_metrics,
+            "binary_val": binary_val_metrics,
+            "score": score,
+        })
+
+        if score > best_score:
+            best_score = score
+            patience_counter = 0
+            monitor_metric = (
+                "train_accuracy"
+                if args.task_mode == "overfit"
+                else args.monitor_metric
+            )
+            best_metrics = {
+                "epoch": epoch,
+                "monitor_metric": monitor_metric,
+                "score": score,
+                "malignant_val": last_val_metrics,
+                "binary_val": binary_val_metrics,
+            }
+            torch.save(
+                _checkpoint_payload(
+                    model,
+                    epoch,
+                    monitor_metric,
+                    score,
+                    last_val_metrics,
+                    binary_val_metrics,
+                ),
+                output_dir / "best_model.pth",
+            )
+            print(
+                f"第 {epoch} 轮保存最佳模型，"
+                f"{monitor_metric}={score:.4f}"
+            )
+        else:
+            patience_counter += 1
+
+        save_training_state(
+            output_dir,
+            history,
+            best_metrics,
+        )
+        print(
+            f"第 {epoch}/{args.epochs} 轮："
+            f"训练损失={train_metrics['total_loss']:.6f}，"
+            f"训练准确率={train_metrics['accuracy']:.4f}，"
+            f"监控值={score:.4f}"
+        )
+        if patience_counter >= args.patience:
+            print(f"连续 {args.patience} 轮未改善，提前停止训练")
+            break
+
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "epoch": history[-1]["epoch"],
+        },
+        output_dir / "final_model.pth",
+    )
+
+    best_checkpoint = torch.load(
+        output_dir / "best_model.pth",
+        map_location=device,
+        weights_only=False,
+    )
+    model.load_state_dict(best_checkpoint["model_state_dict"])
+    if args.task_mode == "overfit":
+        test_metrics = {
+            "malignant": evaluate_loader(
+                model,
+                train_loader,
+                "overfit",
+                device,
+                split_kind="malignant",
+            ),
+            "binary": None,
+        }
+    else:
+        test_metrics = _evaluate_test_sets(
+            model,
+            evaluation_loaders,
+            args,
+            device,
+        )
+    save_json(output_dir / "metrics_test.json", test_metrics)
+    if args.task_mode == "overfit":
+        assert_overfit_gate(
+            args.overfit_samples,
+            history,
+            last_val_metrics,
+        )
+    print(f"训练完成，运行产物已保存到 {output_dir}")
+    return test_metrics
+
+
+if __name__ == "__main__":
+    main(build_parser().parse_args())

@@ -293,6 +293,23 @@ def test_overfit_cli_accepts_both_no_augment_spellings(flag):
     assert "no_augment" not in vars(args)
 
 
+def test_cli_reports_invalid_arguments_in_chinese(capsys):
+    """非法命令行参数必须只暴露可读中文错误。"""
+    parser = build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            "--pretrained_path",
+            "TinyUSFM.pth",
+            "--task_mode",
+            "unknown",
+        ])
+
+    stderr = capsys.readouterr().err
+    assert "参数错误" in stderr
+    assert "error:" not in stderr
+
+
 @pytest.mark.parametrize(
     "overrides, expected_fragment",
     [
@@ -343,9 +360,14 @@ def test_criteria_follow_each_task_mode(
     expected_weight_count,
 ):
     """四种任务模式必须使用各自标签空间的交叉熵。"""
+    samples = _criterion_samples()
+    if task_mode == "flat4":
+        samples = [
+            sample for sample in samples if sample["subtype_label"] != -1
+        ]
     criteria = build_criteria_for_mode(
         task_mode,
-        _criterion_samples(),
+        samples,
         torch.device("cpu"),
     )
 

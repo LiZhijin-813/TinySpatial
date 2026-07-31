@@ -1,5 +1,7 @@
 """用于验证标签、损失、梯度和优化器链路的 BUS-only 过拟合模型。"""
 
+from __future__ import annotations
+
 import os
 
 import torch
