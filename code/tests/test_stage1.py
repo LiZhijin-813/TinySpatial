@@ -11,9 +11,11 @@
 """
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
+import pytest
 import torch
 from code.models.stage1.acm_mim import JointPatchEmbedding, MaskingEngine, LightweightDecoder, ReconstructionLoss
 from code.models.stage1.pretrain_model import ACMMIMPretrainModel
@@ -86,16 +88,15 @@ def test_full_model_forward():
 
 def test_full_model_with_pretrained():
     """加载预训练 TinyUSFM 权重后的前传测试。"""
-    pretrained = "/home/lzj813/TinySpatial_Project/TinyUSFM.pth"
-    if not os.path.exists(pretrained):
-        print("[SKIP] 未找到预训练权重")
-        return
-    model = ACMMIMPretrainModel(pretrained_path=pretrained)
+    project_root = Path(__file__).resolve().parents[2]
+    pretrained = project_root / "TinyUSFM.pth"
+    if not pretrained.exists():
+        pytest.skip("仓库根目录未提供 TinyUSFM.pth")
+    model = ACMMIMPretrainModel(pretrained_path=str(pretrained))
     bus = torch.randn(2, 1, 224, 224)
     swe = torch.randn(2, 3, 224, 224)
     loss, pred, mask = model(bus, swe)
     assert loss.dim() == 0
-    print(f"[PASS] 预训练模型前传: loss={loss.item():.4f}")
 
 
 def test_gradient_flow():
