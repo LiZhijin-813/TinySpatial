@@ -5,13 +5,13 @@
     CDFI → MobileNetV2 → 投影层 → CDFI Tokens → IP-Adapter 注入
     Text → BioClinicalBERT (冻结) → F_text (B×512)
     F_bus_swe + F_text → LightweightCrossAttention → (B, 192+512)
-    → MLP → N 类 softmax
+    → 配置驱动的平坦分类头或良恶性与亚型双任务头
 
 核心设计：
     - TinyUSFM 骨干冻结，仅解冻最后 2 层，保留预训练表征
     - IP-Adapter 仅在最后 2 层注入 CDFI 血流信息，减少可训练参数
     - BioClinicalBERT 完全冻结，仅投影层可训练，避免文本分支过拟合
-    - MLP head 加大 dropout，防止小样本过拟合
+    - 任务头根据任务模式输出平坦分类 logits 或双任务 logits
 """
 import os
 
@@ -28,13 +28,14 @@ from .cdfi_branch import CDFIBranch
 from .ip_adapter import DecoupledAttentionLayer
 from .text_branch import TextLogicBranch
 from .cross_attention import LightweightCrossAttention
+from .task_heads import Stage2TaskHeads
 
 
 class SECSubtypingModel(nn.Module):
     """Stage 2: 语义增强对比分型模型。
 
     多模态微调架构，将 BUS+SWE 解剖硬度特征、CDFI 血流特征、
-    临床文本语义特征融合后进行 N 分类决策（4分类或5分类含良性）。
+    临床文本语义特征融合后，由配置驱动的平坦分类头或双任务头完成决策。
 
     Attributes:
         patch_embed: 联合切片嵌入层 (4ch → patch tokens)
@@ -43,13 +44,13 @@ class SECSubtypingModel(nn.Module):
         ip_adapters: IP-Adapter 解耦交叉注意力层 (第 10-11 层)
         text_branch: 文本语义分支 (BioClinicalBERT 冻结 + 投影层)
         cross_attention: 跨模态特征融合模块
-        mlp_head: N 分类 MLP 决策头
+        task_heads: 平坦分类头或良恶性与亚型双任务头
     """
 
     def __init__(
         self,
         pretrained_path: str = None,
-        num_classes: int = 4,
+        task_mode: str = "flat4",
         embed_dim: int = 192,
         patch_size: int = 16,
         img_size: int = 224,
@@ -62,7 +63,7 @@ class SECSubtypingModel(nn.Module):
         """
         Args:
             pretrained_path: TinyUSFM 预训练权重路径
-            num_classes: 分类类别数，默认 4 (4分类: Luminal A/B, HER2+, TNBC; 5分类: +Benign)
+            task_mode: 任务模式，可选 flat4、flat5 或 dual_head，默认 flat4
             embed_dim: 嵌入维度，默认 192
             patch_size: patch 尺寸，默认 16
             img_size: 输入图像尺寸，默认 224
@@ -73,12 +74,31 @@ class SECSubtypingModel(nn.Module):
             unfreeze_last_n: 解冻编码器最后 N 层，默认 2（保守微调，防止特征坍缩）
         """
         super().__init__()
+        if not 0 <= unfreeze_last_n <= depth:
+            raise ValueError("unfreeze_last_n 必须位于 0 到 depth 的闭区间内")
+
+        if ip_adapter_layers is None:
+            ip_adapter_layers = list(range(10, 12))
+        else:
+            try:
+                ip_adapter_layers = list(ip_adapter_layers)
+            except TypeError as exc:
+                raise ValueError("ip_adapter_layers 必须是编码器层索引序列") from exc
+        if any(
+            not isinstance(layer, int)
+            or isinstance(layer, bool)
+            or not 0 <= layer < depth
+            for layer in ip_adapter_layers
+        ):
+            raise ValueError("ip_adapter_layers 必须是 0 到 depth-1 的整数索引")
+        if len(set(ip_adapter_layers)) != len(ip_adapter_layers):
+            raise ValueError("ip_adapter_layers 不能包含重复索引")
+
         self.embed_dim = embed_dim
         self.num_patches = (img_size // patch_size) ** 2
         self.img_size = img_size
         self.patch_size = patch_size
-        if ip_adapter_layers is None:
-            ip_adapter_layers = list(range(10, 12))
+        self.task_mode = task_mode
         self.ip_adapter_layers = ip_adapter_layers
 
         # ===== 1. BUS+SWE 分支: JointPatchEmbedding + TinyUSFM =====
@@ -101,7 +121,7 @@ class SECSubtypingModel(nn.Module):
         if pretrained_path and os.path.exists(pretrained_path):
             self._load_pretrained(pretrained_path)
 
-        # Partial fine-tuning: 冻结底层，仅解冻最后 N 层 + norm + patch_embed
+        # 冻结底层，仅解冻最后 N 层、归一化层与切片嵌入层。
         for param in self.encoder.parameters():
             param.requires_grad = False
         # 解冻最后 N 层
@@ -134,14 +154,10 @@ class SECSubtypingModel(nn.Module):
             text_dim=512,
         )
 
-        # ===== 6. 分类 MLP =====
-        # 输入: F_bus_swe(192) + cross_attn_out(512) = 704
-        self.mlp_head = nn.Sequential(
-            nn.LayerNorm(embed_dim + 512),
-            nn.Linear(embed_dim + 512, 128),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, num_classes),
+        # ===== 6. 配置驱动的任务头 =====
+        self.task_heads = Stage2TaskHeads(
+            input_dim=embed_dim + 512,
+            task_mode=task_mode,
         )
 
     def _load_pretrained(self, path: str):
@@ -178,11 +194,11 @@ class SECSubtypingModel(nn.Module):
         loaded = len(new_state_dict)
         total = len(self.encoder.state_dict())
         missing_non_patch = [k for k in msg.missing_keys if "patch_embed" not in k]
-        print(f"Loaded {loaded}/{total} encoder weights from {path}")
+        print(f"已从 {path} 加载 {loaded}/{total} 个编码器权重")
         if missing_non_patch:
-            print(f"  Missing (non-patch_embed): {missing_non_patch}")
+            print(f"  缺失的非切片嵌入权重: {missing_non_patch}")
         if msg.unexpected_keys:
-            print(f"  Unexpected: {msg.unexpected_keys[:10]}")
+            print(f"  未预期权重: {msg.unexpected_keys[:10]}")
 
     def set_ip_adapter_scale(self, scale: float):
         """全局设置所有 IP-Adapter 层的缩放因子。
@@ -204,9 +220,8 @@ class SECSubtypingModel(nn.Module):
             attention_mask: (B, max_len) — 注意力掩码
 
         Returns:
-            logits: (B, num_classes) — N 分类 logits
-            F_bus_swe: (B, embed_dim) — 图像混合特征（用于 CAM）
-            F_text: (B, text_dim) — 文本特征（用于 CAM）
+            包含任务 logits、图像特征、文本特征和融合特征的字典。
+            平坦任务返回 class_logits；双任务返回 malignancy_logits 与 subtype_logits。
         """
         B = bus_img.shape[0]
 
@@ -247,7 +262,11 @@ class SECSubtypingModel(nn.Module):
         # === 跨模态特征融合 ===
         fused = self.cross_attention(F_bus_swe, F_text)  # (B, 192+512)
 
-        # === N 分类决策 ===
-        logits = self.mlp_head(fused)  # (B, num_classes)
-
-        return logits, F_bus_swe, F_text
+        # === 任务感知决策 ===
+        task_outputs = self.task_heads(fused)
+        return {
+            **task_outputs,
+            "image_features": F_bus_swe,
+            "text_features": F_text,
+            "fused_features": fused,
+        }
