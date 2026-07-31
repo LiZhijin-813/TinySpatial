@@ -197,6 +197,28 @@ def test_training_transform_normalizes_mismatched_paired_sizes():
     assert bus_out.size == swe_out.size == (224, 224)
 
 
+def test_training_transform_uses_shared_larger_coordinate_grid(monkeypatch):
+    """训练裁剪必须在大于输出尺寸的公共网格中只采样一次。"""
+    bus = Image.new("RGB", (310, 380), color=(128, 0, 0))
+    swe = Image.new("RGB", (368, 372), color=(0, 0, 128))
+    observed_sizes = []
+
+    def fixed_crop_params(image, output_size):
+        observed_sizes.append(image.size)
+        return 1, 1, output_size[0], output_size[1]
+
+    monkeypatch.setattr(
+        "code.datasets.dataset.transforms.RandomCrop.get_params",
+        fixed_crop_params,
+    )
+
+    PairedAlignedTransform(img_size=224)(bus, swe)
+
+    assert observed_sizes == [observed_sizes[0]]
+    assert observed_sizes[0][0] > 224
+    assert observed_sizes[0][1] > 224
+
+
 def test_dataset_reads_mismatched_paired_sizes_after_normalization(
     tiny_multimodal_root,
     fake_tokenizer,

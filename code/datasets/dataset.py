@@ -16,6 +16,7 @@ os.environ['HF_HUB_DOWNLOAD_ENDPOINT'] = 'https://hf-mirror.com'
 
 import json
 import csv
+import math
 import random
 from typing import Dict, Optional, Callable, List, Tuple
 
@@ -56,12 +57,13 @@ class PairedAlignedTransform:
 
     def __init__(self, img_size: int = 224):
         self.img_size = img_size
+        self.coordinate_size = math.ceil(img_size * 1.15)
 
     def _resize_to_coordinate_grid(self, image: Image.Image):
         """将单模态导出图映射到公共归一化坐标网格。"""
         return TF.resize(
             image,
-            [self.img_size, self.img_size],
+            [self.coordinate_size, self.coordinate_size],
             antialias=True,
         )
 
