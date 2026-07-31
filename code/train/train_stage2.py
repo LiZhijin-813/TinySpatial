@@ -57,8 +57,7 @@ class ChineseArgumentParser(argparse.ArgumentParser):
 
     def error(self, message):
         """以中文参数错误结束解析。"""
-        del message
-        self.exit(2, "参数错误：请检查参数名称、取值和格式。\n")
+        self.exit(2, f"参数错误：{message}\n")
 
 
 def build_parser():
@@ -465,8 +464,8 @@ def restore_manifest_splits(canonical_splits, manifest):
     }
 
 
-def evaluate_checkpoint(args, device, canonical_splits):
-    """按检查点相邻配置和清单执行确定性复评。"""
+def load_checkpoint_run_configuration(args):
+    """读取检查点相邻参数与清单，并校验复评任务模式。"""
     checkpoint_path = Path(args.evaluate_checkpoint)
     run_dir = checkpoint_path.parent
     saved_args = json.loads(
@@ -479,7 +478,14 @@ def evaluate_checkpoint(args, device, canonical_splits):
     manifest_mode = manifest.get("task_mode")
     if saved_mode != args.task_mode or manifest_mode != args.task_mode:
         raise ValueError("复评 task_mode 与检查点训练模式或清单不一致")
+    return checkpoint_path, saved_args, manifest
 
+
+def evaluate_checkpoint(args, device, canonical_splits):
+    """按检查点相邻配置和清单执行确定性复评。"""
+    checkpoint_path, saved_args, manifest = load_checkpoint_run_configuration(
+        args
+    )
     restored = restore_manifest_splits(canonical_splits, manifest)
     model_args = argparse.Namespace(**{**vars(args), **saved_args})
     model = build_model(model_args, device)
@@ -516,12 +522,13 @@ def evaluate_checkpoint(args, device, canonical_splits):
     return metrics
 
 
-def assert_overfit_gate(overfit_samples, history, val_metrics):
-    """检查最终训练准确率、损失有限性和四类预测完整性。"""
-    final_accuracy = history[-1]["train"]["accuracy"]
-    final_loss = history[-1]["train"]["total_loss"]
-    prediction_distribution = val_metrics["malignant"][
-        "prediction_distribution"
+def build_overfit_gate_result(overfit_samples, history, val_metrics):
+    """构造可严格 JSON 序列化的过拟合门禁结论。"""
+    final_accuracy = float(history[-1]["train"]["accuracy"])
+    final_loss = float(history[-1]["train"]["total_loss"])
+    prediction_distribution = [
+        int(count)
+        for count in val_metrics["malignant"]["prediction_distribution"]
     ]
     passed = (
         final_accuracy >= 0.98
@@ -529,13 +536,63 @@ def assert_overfit_gate(overfit_samples, history, val_metrics):
         and len(prediction_distribution) == 4
         and all(count > 0 for count in prediction_distribution)
     )
-    if not passed:
-        raise RuntimeError(
-            f"{overfit_samples} 例过拟合门禁失败："
-            f"Accuracy={final_accuracy:.4f}，"
-            f"loss={final_loss:.6f}，"
-            f"prediction_distribution={prediction_distribution}"
-        )
+    if math.isfinite(final_loss):
+        serialized_loss = final_loss
+    elif math.isnan(final_loss):
+        serialized_loss = "nan"
+    elif final_loss > 0:
+        serialized_loss = "inf"
+    else:
+        serialized_loss = "-inf"
+    return {
+        "passed": passed,
+        "sample_count": int(overfit_samples),
+        "final_accuracy": final_accuracy,
+        "final_total_loss": serialized_loss,
+        "prediction_distribution": prediction_distribution,
+    }
+
+
+def _raise_overfit_gate_failure(result):
+    """依据已构造的门禁结论抛出中文失败信息。"""
+    final_loss = result["final_total_loss"]
+    loss_text = (
+        f"{final_loss:.6f}"
+        if isinstance(final_loss, float)
+        else final_loss
+    )
+    raise RuntimeError(
+        f"{result['sample_count']} 例过拟合门禁失败："
+        f"Accuracy={result['final_accuracy']:.4f}，"
+        f"loss={loss_text}，"
+        "prediction_distribution="
+        f"{result['prediction_distribution']}"
+    )
+
+
+def assert_overfit_gate(overfit_samples, history, val_metrics):
+    """检查最终训练准确率、损失有限性和四类预测完整性。"""
+    result = build_overfit_gate_result(
+        overfit_samples,
+        history,
+        val_metrics,
+    )
+    if not result["passed"]:
+        _raise_overfit_gate_failure(result)
+    return result
+
+
+def enforce_overfit_gate(output_dir, overfit_samples, history, val_metrics):
+    """持久化门禁结论，并在失败结论写盘后抛出异常。"""
+    result = build_overfit_gate_result(
+        overfit_samples,
+        history,
+        val_metrics,
+    )
+    save_json(Path(output_dir) / "overfit_gate.json", result)
+    if not result["passed"]:
+        _raise_overfit_gate_failure(result)
+    return result
 
 
 def _multimodal_dataset(samples, split, args, augment=False):
@@ -641,18 +698,32 @@ def main(args):
     device = torch.device(
         args.device if torch.cuda.is_available() else "cpu"
     )
+    if args.evaluate_checkpoint:
+        _, saved_args, _ = load_checkpoint_run_configuration(args)
+        canonical_splits = build_fair_splits(
+            PROJECT_ROOT,
+            saved_args["task_mode"],
+            malignant_metadata=saved_args.get(
+                "malignant_metadata",
+                "metadata.csv",
+            ),
+            benign_metadata=saved_args.get(
+                "benign_metadata",
+                "metadata_5class.csv",
+            ),
+        )
+        return evaluate_checkpoint(
+            args,
+            device,
+            canonical_splits,
+        )
+
     canonical_splits = build_fair_splits(
         PROJECT_ROOT,
         args.task_mode,
         malignant_metadata=args.malignant_metadata,
         benign_metadata=args.benign_metadata,
     )
-    if args.evaluate_checkpoint:
-        return evaluate_checkpoint(
-            args,
-            device,
-            canonical_splits,
-        )
 
     if args.task_mode == "overfit":
         splits = {
@@ -852,7 +923,8 @@ def main(args):
         )
     save_json(output_dir / "metrics_test.json", test_metrics)
     if args.task_mode == "overfit":
-        assert_overfit_gate(
+        enforce_overfit_gate(
+            output_dir,
             args.overfit_samples,
             history,
             last_val_metrics,

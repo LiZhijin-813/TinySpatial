@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from torch.utils.data import RandomSampler, WeightedRandomSampler
 
+from code.train import train_stage2 as train_stage2_module
 from code.train.run_artifacts import (
     initialize_run_artifacts,
     save_json,
@@ -308,6 +309,8 @@ def test_cli_reports_invalid_arguments_in_chinese(capsys):
     stderr = capsys.readouterr().err
     assert "参数错误" in stderr
     assert "error:" not in stderr
+    assert "--task_mode" in stderr
+    assert "unknown" in stderr
 
 
 @pytest.mark.parametrize(
@@ -577,4 +580,155 @@ def test_checkpoint_evaluation_rejects_task_mode_mismatch_before_model_build(
         evaluate_checkpoint(args, torch.device("cpu"), {})
 
     assert "task_mode" in str(error.value)
+    _assert_chinese_value_error(error)
+
+
+def _checkpoint_cli_args(checkpoint_path):
+    return build_parser().parse_args([
+        "--pretrained_path",
+        "TinyUSFM.pth",
+        "--task_mode",
+        "flat4",
+        "--evaluate_checkpoint",
+        str(checkpoint_path),
+    ])
+
+
+def test_checkpoint_main_builds_splits_from_saved_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    """复评 canonical 划分必须使用历史运行保存的自定义元数据。"""
+    checkpoint_path = tmp_path / "best_model.pth"
+    checkpoint_path.touch()
+    save_json(tmp_path / "args.json", {
+        "task_mode": "flat4",
+        "malignant_metadata": "历史恶性.csv",
+        "benign_metadata": "历史良性.csv",
+    })
+    save_json(tmp_path / "split_manifest.json", {
+        "task_mode": "flat4",
+        "splits": {},
+    })
+    canonical_splits = {"malignant_test": [{"case_id": "历史病例"}]}
+
+    def fake_build_fair_splits(
+        project_root,
+        task_mode,
+        malignant_metadata,
+        benign_metadata,
+    ):
+        assert project_root == train_stage2_module.PROJECT_ROOT
+        assert task_mode == "flat4"
+        assert malignant_metadata == "历史恶性.csv"
+        assert benign_metadata == "历史良性.csv"
+        return canonical_splits
+
+    def fake_evaluate_checkpoint(args, device, received_splits):
+        assert received_splits is canonical_splits
+        return {"malignant": {"macro_f1": 0.5}}
+
+    monkeypatch.setattr(
+        train_stage2_module,
+        "build_fair_splits",
+        fake_build_fair_splits,
+    )
+    monkeypatch.setattr(
+        train_stage2_module,
+        "evaluate_checkpoint",
+        fake_evaluate_checkpoint,
+    )
+
+    result = train_stage2_module.main(
+        _checkpoint_cli_args(checkpoint_path)
+    )
+
+    assert result == {"malignant": {"macro_f1": 0.5}}
+
+
+def test_checkpoint_main_validates_saved_mode_before_building_splits(
+    tmp_path,
+    monkeypatch,
+):
+    """保存 task_mode 不一致时不得先读取当前 CLI 对应的数据。"""
+    checkpoint_path = tmp_path / "best_model.pth"
+    checkpoint_path.touch()
+    save_json(tmp_path / "args.json", {
+        "task_mode": "dual_head",
+        "malignant_metadata": "历史恶性.csv",
+        "benign_metadata": "历史良性.csv",
+    })
+    save_json(tmp_path / "split_manifest.json", {
+        "task_mode": "dual_head",
+        "splits": {},
+    })
+
+    def fail_if_splits_are_built(*args, **kwargs):
+        raise AssertionError("task_mode 校验前不应构造 canonical 划分")
+
+    monkeypatch.setattr(
+        train_stage2_module,
+        "build_fair_splits",
+        fail_if_splits_are_built,
+    )
+
+    with pytest.raises(ValueError) as error:
+        train_stage2_module.main(
+            _checkpoint_cli_args(checkpoint_path)
+        )
+
+    assert "task_mode" in str(error.value)
+    _assert_chinese_value_error(error)
+
+
+def test_overfit_gate_success_is_persisted_as_strict_json(tmp_path):
+    """过拟合门禁成功结论必须写入稳定的严格 JSON 结构。"""
+    history = [{"train": {"accuracy": 0.98, "total_loss": 0.001}}]
+    metrics = {"malignant": {"prediction_distribution": [8, 8, 8, 8]}}
+
+    result = train_stage2_module.enforce_overfit_gate(
+        tmp_path,
+        32,
+        history,
+        metrics,
+    )
+
+    raw = (tmp_path / "overfit_gate.json").read_text(encoding="utf-8")
+    assert json.loads(raw) == result == {
+        "passed": True,
+        "sample_count": 32,
+        "final_accuracy": 0.98,
+        "final_total_loss": 0.001,
+        "prediction_distribution": [8, 8, 8, 8],
+    }
+
+
+def test_overfit_gate_failure_is_persisted_before_runtime_error(tmp_path):
+    """非有限损失失败时必须先保存严格 JSON，再抛中文异常。"""
+    history = [{
+        "train": {
+            "accuracy": 1.0,
+            "total_loss": float("nan"),
+        }
+    }]
+    metrics = {"malignant": {"prediction_distribution": [8, 8, 8, 8]}}
+
+    with pytest.raises(RuntimeError) as error:
+        train_stage2_module.enforce_overfit_gate(
+            tmp_path,
+            32,
+            history,
+            metrics,
+        )
+
+    raw = (tmp_path / "overfit_gate.json").read_text(encoding="utf-8")
+    payload = json.loads(raw)
+    assert payload == {
+        "passed": False,
+        "sample_count": 32,
+        "final_accuracy": 1.0,
+        "final_total_loss": "nan",
+        "prediction_distribution": [8, 8, 8, 8],
+    }
+    assert "NaN" not in raw
     _assert_chinese_value_error(error)
