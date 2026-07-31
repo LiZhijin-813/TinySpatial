@@ -7,6 +7,8 @@ from argparse import Namespace
 import numpy as np
 import pytest
 import torch
+from torch import nn
+from torch.utils.data import RandomSampler, WeightedRandomSampler
 
 from code.train.run_artifacts import (
     initialize_run_artifacts,
@@ -14,6 +16,16 @@ from code.train.run_artifacts import (
     save_training_state,
 )
 from code.train.stage2_engine import monitor_value
+from code.train.train_stage2 import (
+    assert_overfit_gate,
+    build_criteria_for_mode,
+    build_optimizer,
+    build_parser,
+    build_train_loader,
+    evaluate_checkpoint,
+    restore_manifest_splits,
+    validate_reliable_configuration,
+)
 
 
 def _assert_chinese_value_error(error):
@@ -244,4 +256,303 @@ def test_unknown_monitor_metric_raises_chinese_value_error():
 
     message = str(error.value)
     assert "monitor_metric" in message
+    _assert_chinese_value_error(error)
+
+
+def test_cli_defaults_to_reliable_flat4_configuration():
+    """统一入口默认选择论文主模型需要的可靠 flat4 配置。"""
+    parser = build_parser()
+
+    args = parser.parse_args(["--pretrained_path", "TinyUSFM.pth"])
+
+    assert args.task_mode == "flat4"
+    assert args.lambda_bm == 0.3
+    assert args.monitor_metric == "malignant_macro_f1"
+    assert args.beta == 0.0
+    assert args.gamma == 0.0
+    assert args.label_smoothing == 0.0
+
+
+@pytest.mark.parametrize("flag", ["--no_augment", "--no-augment"])
+def test_overfit_cli_accepts_both_no_augment_spellings(flag):
+    """下划线和连字符写法必须汇聚到同一个 augment 字段。"""
+    parser = build_parser()
+
+    args = parser.parse_args([
+        "--pretrained_path",
+        "TinyUSFM.pth",
+        "--task_mode",
+        "overfit",
+        "--overfit_samples",
+        "32",
+        flag,
+    ])
+
+    assert args.overfit_samples == 32
+    assert args.augment is False
+    assert "no_augment" not in vars(args)
+
+
+@pytest.mark.parametrize(
+    "overrides, expected_fragment",
+    [
+        ({"beta": 0.1}, "beta"),
+        ({"gamma": 0.1}, "gamma"),
+        ({"label_smoothing": 0.1}, "label_smoothing"),
+        ({"lambda_bm": 0.2}, "lambda_bm"),
+        ({"monitor_metric": "acc"}, "monitor_metric"),
+    ],
+)
+def test_reliable_configuration_rejects_hidden_objective_changes(
+    overrides,
+    expected_fragment,
+):
+    """可靠基线必须拒绝会改变目标函数或模型选择口径的参数。"""
+    args = build_parser().parse_args(["--pretrained_path", "TinyUSFM.pth"])
+    for name, value in overrides.items():
+        setattr(args, name, value)
+
+    with pytest.raises(ValueError) as error:
+        validate_reliable_configuration(args)
+
+    assert expected_fragment in str(error.value)
+    _assert_chinese_value_error(error)
+
+
+def _criterion_samples():
+    return [
+        {"class_label": 0, "malignancy_label": 1, "subtype_label": 0},
+        {"class_label": 0, "malignancy_label": 1, "subtype_label": 0},
+        {"class_label": 1, "malignancy_label": 1, "subtype_label": 1},
+        {"class_label": 4, "malignancy_label": 0, "subtype_label": -1},
+    ]
+
+
+@pytest.mark.parametrize(
+    "task_mode, expected_keys, expected_weight_count",
+    [
+        ("overfit", {"class"}, None),
+        ("flat4", {"class"}, 4),
+        ("flat5", {"class"}, 5),
+        ("dual_head", {"malignancy", "subtype"}, None),
+    ],
+)
+def test_criteria_follow_each_task_mode(
+    task_mode,
+    expected_keys,
+    expected_weight_count,
+):
+    """四种任务模式必须使用各自标签空间的交叉熵。"""
+    criteria = build_criteria_for_mode(
+        task_mode,
+        _criterion_samples(),
+        torch.device("cpu"),
+    )
+
+    assert set(criteria) == expected_keys
+    if expected_weight_count is not None:
+        assert len(criteria["class"].weight) == expected_weight_count
+    if task_mode == "overfit":
+        assert criteria["class"].weight is None
+    if task_mode == "dual_head":
+        assert len(criteria["malignancy"].weight) == 2
+        assert len(criteria["subtype"].weight) == 4
+        assert criteria["malignancy"].weight.tolist() != (
+            criteria["subtype"].weight[:2].tolist()
+        )
+
+
+class _SamplesOnlyDataset(torch.utils.data.Dataset):
+    def __init__(self, samples):
+        self.samples = samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        return self.samples[index]
+
+
+@pytest.mark.parametrize(
+    "task_mode, expected_weights",
+    [
+        ("flat4", [0.5, 0.5, 1.0]),
+        ("flat5", [0.5, 0.5, 1.0]),
+        ("dual_head", [0.5, 0.5, 1.0]),
+    ],
+)
+def test_balanced_sampler_uses_the_training_task_label(
+    task_mode,
+    expected_weights,
+):
+    """平衡采样必须按当前训练目标标签计算逆频率。"""
+    samples = [
+        {"subtype_label": 0, "class_label": 0},
+        {"subtype_label": 0, "class_label": 0},
+        {"subtype_label": 1, "class_label": 4},
+    ]
+    args = Namespace(
+        sampler="balanced",
+        batch_size=2,
+        num_workers=0,
+    )
+
+    loader = build_train_loader(_SamplesOnlyDataset(samples), task_mode, args)
+
+    assert isinstance(loader.sampler, WeightedRandomSampler)
+    assert loader.sampler.weights.tolist() == expected_weights
+
+
+def test_unbalanced_loader_shuffles_and_overfit_rejects_balanced_sampler():
+    """none 使用随机打乱，已均衡的过拟合子集拒绝二次平衡。"""
+    dataset = _SamplesOnlyDataset([
+        {"subtype_label": 0, "class_label": 0},
+        {"subtype_label": 1, "class_label": 1},
+    ])
+    args = Namespace(sampler="none", batch_size=2, num_workers=0)
+
+    loader = build_train_loader(dataset, "overfit", args)
+
+    assert isinstance(loader.sampler, RandomSampler)
+    args.sampler = "balanced"
+    with pytest.raises(ValueError) as error:
+        build_train_loader(dataset, "overfit", args)
+    _assert_chinese_value_error(error)
+
+
+class _TinyEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.blocks = nn.ModuleList([nn.Linear(2, 2), nn.Linear(2, 2)])
+        self.patch_embed = nn.Linear(2, 2)
+        self.norm = nn.LayerNorm(2)
+        for parameter in self.blocks[0].parameters():
+            parameter.requires_grad = False
+
+
+class _TinyTextBranch(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.bert = nn.Linear(2, 2)
+        self.projection = nn.Linear(2, 2)
+        for parameter in self.bert.parameters():
+            parameter.requires_grad = False
+
+
+class _TinyStage2Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.task_heads = nn.Linear(2, 2)
+        self.ip_adapters = nn.ModuleDict({"1": nn.Linear(2, 2)})
+        self.cross_attention = nn.Linear(2, 2)
+        self.cdfi_branch = nn.Linear(2, 2)
+        self.encoder = _TinyEncoder()
+        self.text_branch = _TinyTextBranch()
+
+
+def test_optimizer_covers_every_trainable_parameter_once():
+    """优化器参数组必须覆盖全部可训练参数且没有重复。"""
+    model = _TinyStage2Model()
+
+    optimizer = build_optimizer(model, base_lr=1e-3, weight_decay=0.05)
+
+    optimized = [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    expected = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    assert {id(parameter) for parameter in optimized} == {
+        id(parameter) for parameter in expected
+    }
+    assert len(optimized) == len({id(parameter) for parameter in optimized})
+    assert {group["name"] for group in optimizer.param_groups} == {
+        "task_heads",
+        "ip_adapters",
+        "cross_attention",
+        "cdfi_branch",
+        "encoder_block_1",
+        "patch_embed_norm",
+        "text_projection",
+    }
+
+
+@pytest.mark.parametrize(
+    "history, prediction_distribution",
+    [
+        ([{"train": {"accuracy": 0.97, "total_loss": 0.01}}], [8, 8, 8, 8]),
+        ([{"train": {"accuracy": 1.0, "total_loss": float("nan")}}], [8, 8, 8, 8]),
+        ([{"train": {"accuracy": 1.0, "total_loss": 0.01}}], [16, 16, 0, 0]),
+    ],
+)
+def test_overfit_gate_rejects_each_failure_condition(
+    history,
+    prediction_distribution,
+):
+    """门禁必须同时满足准确率、有限损失和四类预测齐全。"""
+    metrics = {
+        "malignant": {
+            "prediction_distribution": prediction_distribution,
+        }
+    }
+
+    with pytest.raises(RuntimeError) as error:
+        assert_overfit_gate(32, history, metrics)
+
+    _assert_chinese_value_error(error)
+
+
+def test_overfit_gate_accepts_complete_four_class_fit():
+    """满足全部约束的过拟合事实必须通过门禁。"""
+    history = [{"train": {"accuracy": 0.98, "total_loss": 0.001}}]
+    metrics = {"malignant": {"prediction_distribution": [8, 8, 8, 8]}}
+
+    assert_overfit_gate(32, history, metrics)
+
+
+def test_restore_manifest_splits_preserves_exact_names_and_case_order():
+    """复评必须按 manifest 原名和 case ID 顺序精确恢复。"""
+    canonical = {
+        "train": [{"case_id": "A"}, {"case_id": "B"}],
+        "malignant_test": [{"case_id": "C"}, {"case_id": "A"}],
+    }
+    manifest = {
+        "splits": {
+            "train": ["B", "A"],
+            "malignant_test": ["C"],
+        }
+    }
+
+    restored = restore_manifest_splits(canonical, manifest)
+
+    assert list(restored) == ["train", "malignant_test"]
+    assert [sample["case_id"] for sample in restored["train"]] == ["B", "A"]
+    assert [sample["case_id"] for sample in restored["malignant_test"]] == ["C"]
+
+
+def test_checkpoint_evaluation_rejects_task_mode_mismatch_before_model_build(
+    tmp_path,
+):
+    """复评必须先校验检查点训练模式，禁止用当前模式静默覆盖。"""
+    checkpoint_path = tmp_path / "best_model.pth"
+    checkpoint_path.touch()
+    save_json(tmp_path / "args.json", {
+        "task_mode": "dual_head",
+        "img_size": 224,
+        "max_text_len": 128,
+    })
+    save_json(tmp_path / "split_manifest.json", {
+        "task_mode": "dual_head",
+        "splits": {},
+    })
+    args = Namespace(
+        evaluate_checkpoint=str(checkpoint_path),
+        task_mode="flat4",
+        eval_output=str(tmp_path / "metrics.json"),
+    )
+
+    with pytest.raises(ValueError) as error:
+        evaluate_checkpoint(args, torch.device("cpu"), {})
+
+    assert "task_mode" in str(error.value)
     _assert_chinese_value_error(error)
