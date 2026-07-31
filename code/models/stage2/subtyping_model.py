@@ -1,7 +1,7 @@
 """Stage 2: SEC-Subtyping — 语义增强对比分型多模态微调架构。
 
 完整前传流程：
-    BUS+SWE → JointPatchEmbedding → 冻结 TinyUSFM (+ CDFI IP-Adapter at 第10-11层) → F_bus_swe (B×192)
+    BUS+SWE → JointPatchEmbedding → 冻结 TinyUSFM（CDFI IP-Adapter 默认注入最后两层）→ F_bus_swe (B×192)
     CDFI → MobileNetV2 → 投影层 → CDFI Tokens → IP-Adapter 注入
     Text → BioClinicalBERT (冻结) → F_text (B×512)
     F_bus_swe + F_text → LightweightCrossAttention → (B, 192+512)
@@ -41,7 +41,7 @@ class SECSubtypingModel(nn.Module):
         patch_embed: 联合切片嵌入层 (4ch → patch tokens)
         encoder: 冻结的 TinyUSFM ViT 编码器
         cdfi_branch: CDFI 特征提取支路 (MobileNetV2)
-        ip_adapters: IP-Adapter 解耦交叉注意力层 (第 10-11 层)
+        ip_adapters: IP-Adapter 解耦交叉注意力层（默认最后两层）
         text_branch: 文本语义分支 (BioClinicalBERT 冻结 + 投影层)
         cross_attention: 跨模态特征融合模块
         task_heads: 平坦分类头或良恶性与亚型双任务头
@@ -67,18 +67,24 @@ class SECSubtypingModel(nn.Module):
             embed_dim: 嵌入维度，默认 192
             patch_size: patch 尺寸，默认 16
             img_size: 输入图像尺寸，默认 224
-            depth: 编码器层数，默认 12
+            depth: 编码器层数，必须为正整数，默认 12
             num_heads: 注意力头数，默认 12
-            ip_adapter_layers: 注入 IP-Adapter 的层索引列表，默认 [10,11]
+            ip_adapter_layers: 注入 IP-Adapter 的层索引列表，默认编码器最后两层
             ip_adapter_scale: IP-Adapter 缩放因子，默认 0.1
             unfreeze_last_n: 解冻编码器最后 N 层，默认 2（保守微调，防止特征坍缩）
         """
         super().__init__()
-        if not 0 <= unfreeze_last_n <= depth:
-            raise ValueError("unfreeze_last_n 必须位于 0 到 depth 的闭区间内")
+        if isinstance(depth, bool) or not isinstance(depth, int) or depth <= 0:
+            raise ValueError("depth 必须是非布尔正整数")
+        if (
+            isinstance(unfreeze_last_n, bool)
+            or not isinstance(unfreeze_last_n, int)
+            or not 0 <= unfreeze_last_n <= depth
+        ):
+            raise ValueError("unfreeze_last_n 必须是 0 到 depth 的非布尔整数")
 
         if ip_adapter_layers is None:
-            ip_adapter_layers = list(range(10, 12))
+            ip_adapter_layers = list(range(max(0, depth - 2), depth))
         else:
             try:
                 ip_adapter_layers = list(ip_adapter_layers)
@@ -137,7 +143,7 @@ class SECSubtypingModel(nn.Module):
         # ===== 2. CDFI 分支 =====
         self.cdfi_branch = CDFIBranch(out_dim=embed_dim, img_size=img_size)
 
-        # ===== 3. IP-Adapter 层（注入第 10-11 层） =====
+        # ===== 3. IP-Adapter 层（默认注入最后两层） =====
         self.ip_adapters = nn.ModuleDict({
             str(i): DecoupledAttentionLayer(embed_dim=embed_dim, num_heads=num_heads, cdfi_dim=embed_dim)
             for i in ip_adapter_layers
@@ -164,7 +170,7 @@ class SECSubtypingModel(nn.Module):
         """加载 TinyUSFM 预训练权重（支持 Stage 1 或原始权重）。
 
         自动处理不同格式的 checkpoint（含 model/model_state_dict 键），
-        跳过 patch_embed 权重（3ch→4ch 形状不匹配）。
+        仅加载名称存在、Tensor 类型且形状完全匹配的编码器权重。
 
         Stage 1 checkpoint 中同时存在顶层和 encoder. 前缀的 pos_embed/cls_token，
         顶层键（训练过的）优先于 encoder. 前缀键（VisionTransformer 原始未训练值）。
@@ -177,23 +183,27 @@ class SECSubtypingModel(nn.Module):
         else:
             state_dict = checkpoint
 
-        # 先收集所有可能的键名映射，顶层键优先于 encoder. 前缀键
-        new_state_dict = {}
+        encoder_state = self.encoder.state_dict()
+        compatible_state = {}
+        skipped_shape_mismatch = []
+        # 先收集所有可能的兼容键名映射，顶层键优先于 encoder. 前缀键。
         for k, v in state_dict.items():
             name = k.replace("model.", "").replace("module.", "").replace("backbone.", "").replace("encoder.", "")
-            if name in self.encoder.state_dict():
-                if "patch_embed" in name:
-                    continue  # 跳过: 3ch→4ch 形状不匹配
-                # 顶层键（不含 encoder. 前缀的原始键）优先，避免未训练值覆盖已训练值
-                if not k.startswith("encoder."):
-                    new_state_dict[name] = v
-                elif name not in new_state_dict:
-                    new_state_dict[name] = v
+            if name not in encoder_state or not isinstance(v, torch.Tensor):
+                continue
+            if encoder_state[name].shape != v.shape:
+                skipped_shape_mismatch.append(name)
+                continue
+            # 顶层键优先，避免未训练的 encoder. 前缀键覆盖已训练顶层键。
+            if not k.startswith("encoder.") or name not in compatible_state:
+                compatible_state[name] = v
 
-        msg = self.encoder.load_state_dict(new_state_dict, strict=False)
-        loaded = len(new_state_dict)
+        msg = self.encoder.load_state_dict(compatible_state, strict=False)
+        loaded = len(compatible_state)
         total = len(self.encoder.state_dict())
         missing_non_patch = [k for k in msg.missing_keys if "patch_embed" not in k]
+        if skipped_shape_mismatch:
+            print(f"已跳过 {len(skipped_shape_mismatch)} 个形状不匹配的预训练权重")
         print(f"已从 {path} 加载 {loaded}/{total} 个编码器权重")
         if missing_non_patch:
             print(f"  缺失的非切片嵌入权重: {missing_non_patch}")

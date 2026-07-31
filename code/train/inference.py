@@ -29,19 +29,85 @@ SUBTYPE_NAMES_4 = ["Luminal A", "Luminal B", "HER2+", "TNBC"]
 SUBTYPE_NAMES_5 = ["Luminal A", "Luminal B", "HER2+", "TNBC", "Benign"]
 
 
+def task_predictions_and_probabilities(outputs, task_mode):
+    """按任务模式将结构化 logits 转换为预测类别和概率。"""
+    if task_mode in {"flat4", "flat5"}:
+        probabilities = torch.softmax(outputs["class_logits"], dim=1)
+        return probabilities.argmax(dim=1), probabilities
+
+    if task_mode == "dual_head":
+        malignancy_probabilities = torch.softmax(outputs["malignancy_logits"], dim=1)
+        subtype_probabilities = torch.softmax(outputs["subtype_logits"], dim=1)
+        predictions = subtype_probabilities.argmax(dim=1)
+        benign_predictions = torch.full_like(predictions, 4)
+        predictions = torch.where(
+            outputs["malignancy_logits"].argmax(dim=1) == 0,
+            benign_predictions,
+            predictions,
+        )
+        probabilities = torch.cat(
+            [
+                malignancy_probabilities[:, 1:2] * subtype_probabilities,
+                malignancy_probabilities[:, 0:1],
+            ],
+            dim=1,
+        )
+        return predictions, probabilities
+
+    raise ValueError(f"不支持的任务模式: {task_mode}")
+
+
+def _extract_state_dict(checkpoint):
+    """从常见检查点结构中提取参数字典。"""
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif isinstance(checkpoint, dict) and "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    else:
+        state_dict = checkpoint
+    if not isinstance(state_dict, dict):
+        raise ValueError("检查点必须是参数字典或包含参数字典的检查点")
+    return state_dict
+
+
+def load_stage2_checkpoint(model, checkpoint_path, device):
+    """加载结构化 Stage 2 检查点，并拒绝不兼容的分类头。"""
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state_dict = _extract_state_dict(checkpoint)
+    keys = tuple(state_dict)
+
+    if any(key.startswith("mlp_head.") for key in keys):
+        raise ValueError("检查点包含旧版 mlp_head 分类头，无法用于结构化任务接口")
+    if not any(key.startswith("task_heads.") for key in keys):
+        raise ValueError("检查点缺少任务头参数，无法用于结构化任务接口")
+
+    try:
+        incompatible = model.load_state_dict(state_dict, strict=False)
+    except RuntimeError as exc:
+        raise ValueError("检查点参数形状不匹配，无法加载结构化任务接口") from exc
+
+    if any(key.startswith("task_heads.") for key in incompatible.missing_keys):
+        raise ValueError("当前模型缺少检查点要求的任务头参数")
+    if any(key.startswith("mlp_head.") for key in incompatible.unexpected_keys):
+        raise ValueError("检查点包含旧版 mlp_head 分类头，无法用于结构化任务接口")
+
+    print(f"已加载结构化 Stage 2 检查点: {checkpoint_path}")
+
+
 @torch.no_grad()
-def predict_batch(model, dataloader, device):
+def predict_batch(model, dataloader, device, task_mode):
     """对数据集执行批量推理，返回预测结果与标签。
 
     Args:
         model: SECSubtypingModel 模型
         dataloader: 数据加载器
         device: 计算设备
+        task_mode: 任务模式
 
     Returns:
         preds: (N,) 预测标签数组
         labels: (N,) 真实标签数组
-        probs: (N, num_classes) 预测概率数组
+        probs: (N, C) 预测概率数组
     """
     model.eval()
     all_preds = []
@@ -55,17 +121,29 @@ def predict_batch(model, dataloader, device):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
 
-        logits, _, _ = model(bus_img, swe_img, cdfi_img, input_ids, attention_mask)
-        probs = torch.softmax(logits, dim=1)
+        outputs = model(bus_img, swe_img, cdfi_img, input_ids, attention_mask)
+        predictions, probabilities = task_predictions_and_probabilities(outputs, task_mode)
+        label_key = "subtype_label" if task_mode == "flat4" else "class_label"
 
-        all_preds.extend(logits.argmax(dim=1).cpu().numpy())
-        all_labels.extend(batch["subtype_label"].numpy())
-        all_probs.extend(probs.cpu().numpy())
+        all_preds.extend(predictions.cpu().numpy())
+        all_labels.extend(batch[label_key].numpy())
+        all_probs.extend(probabilities.cpu().numpy())
 
     return np.array(all_preds), np.array(all_labels), np.array(all_probs)
 
 
-def predict_single(model, bus_path, swe_path, cdfi_path, text_path, device, img_size=224, max_text_len=128, subtype_names=None):
+def predict_single(
+    model,
+    bus_path,
+    swe_path,
+    cdfi_path,
+    text_path,
+    device,
+    task_mode,
+    img_size=224,
+    max_text_len=128,
+    subtype_names=None,
+):
     """对单个病例进行亚型预测。
 
     Args:
@@ -75,6 +153,7 @@ def predict_single(model, bus_path, swe_path, cdfi_path, text_path, device, img_
         cdfi_path: CDFI 图像路径
         text_path: 临床文本 JSON 路径
         device: 计算设备
+        task_mode: 任务模式
         img_size: 输入图像尺寸，默认 224
         max_text_len: 文本最大长度，默认 128
 
@@ -124,11 +203,14 @@ def predict_single(model, bus_path, swe_path, cdfi_path, text_path, device, img_
 
     # 推理
     with torch.no_grad():
-        logits, _, _ = model(bus_tensor, swe_tensor, cdfi_tensor, input_ids, attention_mask)
-        probs = torch.softmax(logits, dim=1).cpu().squeeze(0)
+        outputs = model(bus_tensor, swe_tensor, cdfi_tensor, input_ids, attention_mask)
+        predictions, probabilities = task_predictions_and_probabilities(outputs, task_mode)
+        probs = probabilities.cpu().squeeze(0)
 
-    pred_class = probs.argmax().item()
-    names = subtype_names or SUBTYPE_NAMES_4
+    pred_class = predictions.item()
+    names = subtype_names or (
+        SUBTYPE_NAMES_4 if task_mode == "flat4" else SUBTYPE_NAMES_5
+    )
     result = {
         "predicted_subtype": names[pred_class],
         "predicted_label": pred_class,
@@ -143,29 +225,23 @@ def main(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     # 加载模型
-    subtype_names = SUBTYPE_NAMES_5 if args.num_classes == 5 else SUBTYPE_NAMES_4
+    subtype_names = (
+        SUBTYPE_NAMES_4 if args.task_mode == "flat4" else SUBTYPE_NAMES_5
+    )
     model = SECSubtypingModel(
         pretrained_path=None,
-        num_classes=args.num_classes,
+        task_mode=args.task_mode,
         img_size=args.img_size,
     ).to(device)
 
     if args.checkpoint:
-        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        # 处理 Stage 1 checkpoint (model_state_dict) 和 Stage 2 checkpoint
-        if "model_state_dict" in ckpt:
-            model.load_state_dict(ckpt["model_state_dict"], strict=False)
-        elif "model" in ckpt:
-            model.load_state_dict(ckpt["model"], strict=False)
-        else:
-            model.load_state_dict(ckpt, strict=False)
-        print(f"已加载检查点: {args.checkpoint}")
+        load_stage2_checkpoint(model, args.checkpoint, device)
 
     if args.mode == "single":
         # 单例预测模式
         result = predict_single(
             model, args.bus_path, args.swe_path, args.cdfi_path, args.text_path, device,
-            img_size=args.img_size, subtype_names=subtype_names,
+            args.task_mode, img_size=args.img_size, subtype_names=subtype_names,
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
 
@@ -177,16 +253,25 @@ def main(args):
         )
         loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-        preds, labels, probs = predict_batch(model, loader, device)
+        preds, labels, probs = predict_batch(model, loader, device, args.task_mode)
 
         # 临床评估
-        results = evaluate_predictions(labels, preds, save_dir=args.output_dir)
+        results = evaluate_predictions(
+            labels,
+            preds,
+            class_names=subtype_names,
+            save_dir=args.output_dir,
+        )
         print_evaluation(results)
 
         # 保存详细评估结果
         if args.output_dir:
             os.makedirs(args.output_dir, exist_ok=True)
-            with open(os.path.join(args.output_dir, "evaluation_results.json"), "w") as f:
+            with open(
+                os.path.join(args.output_dir, "evaluation_results.json"),
+                "w",
+                encoding="utf-8",
+            ) as f:
                 # NumPy 类型 JSON 序列化转换器
                 def convert(obj):
                     if isinstance(obj, np.floating):
@@ -196,17 +281,23 @@ def main(args):
                     if isinstance(obj, np.ndarray):
                         return obj.tolist()
                     return obj
-                json.dump(results, f, indent=2, default=convert)
+                json.dump(results, f, indent=2, default=convert, ensure_ascii=False)
             print(f"评估结果已保存至: {args.output_dir}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="推理与评估 (Inference & Evaluation)")
+    parser = argparse.ArgumentParser(description="推理与评估")
     parser.add_argument("--mode", type=str, default="batch", choices=["single", "batch"],
                         help="推理模式: single(单例) 或 batch(批量)")
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="训练好的模型检查点路径")
-    parser.add_argument("--num_classes", type=int, default=4, help="分类类别数 (4 或 5)")
+    parser.add_argument(
+        "--task_mode",
+        type=str,
+        default="flat4",
+        choices=["flat4", "flat5", "dual_head"],
+        help="任务模式：flat4、flat5 或 dual_head",
+    )
     parser.add_argument("--metadata_file", type=str, default="metadata.csv",
                         help="元数据文件名 (4分类用 metadata.csv, 5分类用 metadata_5class.csv)")
     parser.add_argument("--split", type=str, default="test",
