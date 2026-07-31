@@ -1,5 +1,6 @@
 """Stage 2 单轮训练、任务感知评估和模型选择工具。"""
 
+from collections.abc import Mapping
 from math import isfinite
 from numbers import Integral, Real
 
@@ -33,17 +34,6 @@ def _validate_task_mode(task_mode):
         raise ValueError(f"未知 task_mode: {task_mode}")
 
 
-def _loader_length(loader, purpose):
-    """读取并校验数据加载器批次数。"""
-    try:
-        batch_count = len(loader)
-    except (TypeError, AttributeError) as error:
-        raise ValueError(f"{purpose}数据加载器必须支持长度查询") from error
-    if batch_count <= 0:
-        raise ValueError(f"{purpose}数据加载器不能为空")
-    return batch_count
-
-
 def _validate_accum_steps(accum_steps):
     """校验梯度累积步数为非布尔正整数。"""
     if (
@@ -75,6 +65,25 @@ def move_batch_to_device(batch, device):
     }
 
 
+def _step_accumulated_gradients(
+    model,
+    optimizer,
+    group_count,
+    max_grad_norm,
+):
+    """按真实累积批次数归一化梯度并执行一次优化。"""
+    for parameter in model.parameters():
+        if parameter.grad is not None:
+            parameter.grad.div_(group_count)
+    if max_grad_norm > 0:
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_grad_norm,
+        )
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+
 def train_one_epoch(
     model,
     loader,
@@ -88,7 +97,6 @@ def train_one_epoch(
 ):
     """按任务模式执行一个训练轮次并返回未缩放损失均值。"""
     _validate_task_mode(task_mode)
-    batch_count = _loader_length(loader, "训练")
     accum_steps = _validate_accum_steps(accum_steps)
     max_grad_norm = _validate_max_grad_norm(max_grad_norm)
 
@@ -98,10 +106,9 @@ def train_one_epoch(
     sample_count = 0
     correct = 0
     processed_batches = 0
+    group_count = 0
 
-    for step, raw_batch in enumerate(
-        tqdm(loader, desc="训练", leave=False)
-    ):
+    for raw_batch in tqdm(loader, desc="训练", leave=False):
         batch = move_batch_to_device(raw_batch, device)
         if task_mode == "overfit":
             outputs = model(batch["bus_img"])
@@ -139,20 +146,8 @@ def train_one_epoch(
                 predictions = outputs["subtype_logits"][malignant].argmax(dim=1)
                 labels = batch["subtype_label"][malignant]
 
-        group_start = (step // accum_steps) * accum_steps
-        group_size = min(accum_steps, batch_count - group_start)
-        (losses["total_loss"] / group_size).backward()
-
-        is_group_end = (step + 1) % accum_steps == 0
-        is_last_batch = step + 1 == batch_count
-        if is_group_end or is_last_batch:
-            if max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    max_grad_norm,
-                )
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+        losses["total_loss"].backward()
+        group_count += 1
 
         for name, value in losses.items():
             totals[name] = totals.get(name, 0.0) + float(
@@ -162,8 +157,24 @@ def train_one_epoch(
         sample_count += int(labels.numel())
         processed_batches += 1
 
+        if group_count == accum_steps:
+            _step_accumulated_gradients(
+                model,
+                optimizer,
+                group_count,
+                max_grad_norm,
+            )
+            group_count = 0
+
     if processed_batches == 0:
         raise ValueError("训练数据加载器未产生任何 batch")
+    if group_count > 0:
+        _step_accumulated_gradients(
+            model,
+            optimizer,
+            group_count,
+            max_grad_norm,
+        )
 
     return {
         **{
@@ -221,12 +232,12 @@ def evaluate_loader(model, loader, task_mode, device, split_kind):
         raise ValueError(
             f"task_mode={task_mode} 不支持 split_kind={split_kind}"
         )
-    _loader_length(loader, "评估")
 
     model.eval()
     labels = {"class": [], "subtype": [], "malignancy": []}
     logits = {"class": [], "subtype": [], "malignancy": []}
     image_features = []
+    processed_batches = 0
 
     for raw_batch in loader:
         batch = move_batch_to_device(raw_batch, device)
@@ -252,6 +263,10 @@ def evaluate_loader(model, loader, task_mode, device, split_kind):
             image_features.append(
                 outputs["image_features"].detach().cpu()
             )
+        processed_batches += 1
+
+    if processed_batches == 0:
+        raise ValueError("评估数据加载器未产生任何 batch")
 
     diagnostic = _evaluation_diagnostic(logits, image_features)
 
@@ -346,35 +361,76 @@ def evaluate_loader(model, loader, task_mode, device, split_kind):
     return {"binary": binary, "diagnostic": diagnostic}
 
 
-def _select_metric_section(metrics, section_names):
-    """按兼容优先级选择首个可用指标分区。"""
-    for name in section_names:
-        section = metrics.get(name)
-        if section is not None:
-            return section
-    raise ValueError("指标中缺少可用的评估分区")
+def _metric_value(metrics, section_names, metric_key):
+    """按分区优先级读取首个非空映射中的有限实数指标。"""
+    if not isinstance(metrics, Mapping):
+        raise ValueError("metrics 必须是指标映射")
+
+    for section_name in section_names:
+        if section_name not in metrics:
+            continue
+        section = metrics[section_name]
+        if section is None:
+            continue
+        if not isinstance(section, Mapping):
+            raise ValueError(f"指标分区 {section_name} 必须是映射")
+        if not section:
+            continue
+        if metric_key not in section:
+            raise ValueError(
+                f"指标分区 {section_name} 缺少 {metric_key}"
+            )
+
+        value = section[metric_key]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Real)
+            or not isfinite(value)
+        ):
+            raise ValueError(
+                f"指标 {section_name}.{metric_key} 必须是有限实数"
+            )
+        return float(value)
+
+    raise ValueError(
+        f"metrics 缺少包含 {metric_key} 的可用指标分区"
+    )
 
 
-def monitor_value(metrics, monitor_metric):
-    """按监控项读取模型选择数值。"""
-    if monitor_metric == "malignant_macro_f1":
-        return float(metrics["malignant"]["macro_f1"])
-    if monitor_metric == "macro_f1":
-        section = _select_metric_section(
-            metrics,
+def monitor_value(
+    metrics,
+    monitor_metric,
+    allow_diagnostic=False,
+):
+    """安全读取主模型选择指标或显式授权的诊断指标。"""
+    if not isinstance(allow_diagnostic, bool):
+        raise ValueError("allow_diagnostic 必须是布尔值")
+
+    metric_specs = {
+        "malignant_macro_f1": (
+            ("malignant",),
+            "macro_f1",
+        ),
+        "macro_f1": (
             ("malignant", "overall", "binary"),
-        )
-        return float(section["macro_f1"])
-    if monitor_metric == "balanced_acc":
-        section = _select_metric_section(
-            metrics,
+            "macro_f1",
+        ),
+        "balanced_acc": (
             ("malignant", "overall", "binary"),
-        )
-        return float(section["balanced_accuracy"])
-    if monitor_metric == "acc":
-        section = _select_metric_section(
-            metrics,
+            "balanced_accuracy",
+        ),
+        "acc": (
             ("overall", "malignant", "binary"),
+            "accuracy",
+        ),
+    }
+    if monitor_metric not in metric_specs:
+        raise ValueError(f"未知 monitor_metric: {monitor_metric}")
+    if monitor_metric != "malignant_macro_f1" and not allow_diagnostic:
+        raise ValueError(
+            "默认模型选择仅允许 malignant_macro_f1，"
+            "诊断指标必须显式启用"
         )
-        return float(section["accuracy"])
-    raise ValueError(f"未知 monitor_metric: {monitor_metric}")
+
+    section_names, metric_key = metric_specs[monitor_metric]
+    return _metric_value(metrics, section_names, metric_key)
