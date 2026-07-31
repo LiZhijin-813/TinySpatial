@@ -992,7 +992,10 @@ def main(args):
             f"训练准确率={train_metrics['accuracy']:.4f}，"
             f"监控值={score:.4f}"
         )
-        if patience_counter >= args.patience:
+        if (
+            args.task_mode != "overfit"
+            and patience_counter >= args.patience
+        ):
             print(f"连续 {args.patience} 轮未改善，提前停止训练")
             break
 

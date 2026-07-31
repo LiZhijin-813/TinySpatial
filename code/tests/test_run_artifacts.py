@@ -931,3 +931,67 @@ def test_overfit_64_accepts_matching_successful_32_gate(tmp_path):
     ])
 
     train_stage2_module.validate_overfit_64_prerequisite(args)
+
+
+def test_overfit_main_runs_all_epochs_despite_early_stopping_patience(
+    tmp_path,
+    monkeypatch,
+):
+    """过拟合门禁必须完成指定 epoch，不能被早停截断。"""
+    samples = [
+        {
+            "case_id": f"{label}-{index}",
+            "class_label": label,
+            "malignancy_label": 1,
+            "subtype_label": label,
+            "split": "train",
+            "source": "malignant",
+        }
+        for label in range(4)
+        for index in range(8)
+    ]
+    train_results = iter([
+        {"total_loss": 0.1, "accuracy": 1.0},
+        {"total_loss": 0.2, "accuracy": 0.5},
+        {"total_loss": 0.01, "accuracy": 1.0},
+    ])
+    monkeypatch.setattr(
+        train_stage2_module,
+        "build_fair_splits",
+        lambda *args, **kwargs: {"train": samples},
+    )
+    monkeypatch.setattr(
+        train_stage2_module,
+        "BUSOverfitDataset",
+        _MainLoopOverfitDataset,
+    )
+    monkeypatch.setattr(
+        train_stage2_module,
+        "build_model",
+        lambda args, device: nn.Linear(1, 1).to(device),
+    )
+    monkeypatch.setattr(
+        train_stage2_module,
+        "train_one_epoch",
+        lambda *args, **kwargs: next(train_results),
+    )
+    monkeypatch.setattr(
+        train_stage2_module,
+        "evaluate_loader",
+        lambda *args, **kwargs: {
+            "malignant": {"prediction_distribution": [8, 8, 8, 8]}
+        },
+    )
+    args = build_parser().parse_args([
+        "--pretrained_path", "TinyUSFM.pth", "--task_mode", "overfit",
+        "--epochs", "3", "--patience", "1", "--num_workers", "0",
+        "--output_root", str(tmp_path),
+    ])
+
+    train_stage2_module.main(args)
+
+    run_dir = next(tmp_path.glob("overfit_*"))
+    history = json.loads((run_dir / "history.json").read_text(encoding="utf-8"))
+    gate = json.loads((run_dir / "overfit_gate.json").read_text(encoding="utf-8"))
+    assert len(history) == 3
+    assert gate["passed"] is True
