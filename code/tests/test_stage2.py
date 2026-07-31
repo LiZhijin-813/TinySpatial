@@ -184,3 +184,65 @@ def test_only_configured_encoder_layers_receive_gradients(monkeypatch):
     assert _has_finite_nonzero_gradient(model.encoder.blocks[1].parameters())
     assert _has_finite_nonzero_gradient(model.task_heads.parameters())
     assert _has_finite_nonzero_gradient(model.ip_adapters.parameters())
+
+
+def _small_model(monkeypatch, **overrides):
+    """构造不加载外部文本模型的最小 Stage 2 模型。"""
+    monkeypatch.setattr(subtyping_module, "TextLogicBranch", FakeTextBranch)
+    settings = {
+        "pretrained_path": None,
+        "img_size": 32,
+        "patch_size": 16,
+        "embed_dim": 48,
+        "depth": 2,
+        "num_heads": 4,
+        "ip_adapter_layers": [1],
+        "unfreeze_last_n": 1,
+    }
+    settings.update(overrides)
+    return subtyping_module.SECSubtypingModel(**settings)
+
+
+def test_default_ip_adapter_layers_follow_encoder_depth(monkeypatch):
+    """未指定注入层时，深度为二的编码器默认使用最后两层。"""
+    model = _small_model(monkeypatch, ip_adapter_layers=None)
+
+    assert model.ip_adapter_layers == [0, 1]
+    assert set(model.ip_adapters) == {"0", "1"}
+
+
+@pytest.mark.parametrize("invalid_unfreeze_last_n", [True, 1.5, -1, 3])
+def test_unfreeze_last_n_requires_non_boolean_integer_in_range(
+    monkeypatch,
+    invalid_unfreeze_last_n,
+):
+    """解冻层数必须是范围内且非布尔值的整数。"""
+    with pytest.raises(ValueError, match="unfreeze_last_n"):
+        _small_model(monkeypatch, unfreeze_last_n=invalid_unfreeze_last_n)
+
+
+def test_pretrained_loader_skips_mismatched_tensors_and_loads_matching_ones(
+    monkeypatch,
+    tmp_path,
+):
+    """预训练加载应忽略形状不符参数，同时载入形状匹配参数。"""
+    model = _small_model(monkeypatch)
+    expected_norm_weight = model.encoder.norm.weight.detach().clone() + 1
+    checkpoint_path = tmp_path / "incompatible_checkpoint.pth"
+    torch.save(
+        {
+            "model": {
+                "pos_embed": torch.randn(
+                    1,
+                    model.encoder.pos_embed.shape[1] + 1,
+                    model.encoder.pos_embed.shape[2],
+                ),
+                "norm.weight": expected_norm_weight,
+            }
+        },
+        checkpoint_path,
+    )
+
+    model._load_pretrained(str(checkpoint_path))
+
+    assert torch.equal(model.encoder.norm.weight, expected_norm_weight)
