@@ -520,6 +520,15 @@ def load_checkpoint_run_configuration(args):
     manifest_mode = manifest.get("task_mode")
     if saved_mode != args.task_mode or manifest_mode != args.task_mode:
         raise ValueError("复评 task_mode 与检查点训练模式或清单不一致")
+    required_fields = ("malignant_metadata", "benign_metadata")
+    missing_fields = [
+        field for field in required_fields if not saved_args.get(field)
+    ]
+    if missing_fields:
+        raise ValueError(
+            "检查点参数缺少划分所需字段："
+            + ", ".join(missing_fields)
+        )
     return checkpoint_path, saved_args, manifest
 
 
@@ -564,17 +573,21 @@ def evaluate_checkpoint(args, device, canonical_splits):
     return metrics
 
 
-def build_overfit_gate_result(overfit_samples, history, val_metrics):
+def build_overfit_gate_result(overfit_samples, history, val_metrics=None):
     """构造可严格 JSON 序列化的过拟合门禁结论。"""
     final_accuracy = float(history[-1]["train"]["accuracy"])
     final_loss = float(history[-1]["train"]["total_loss"])
-    prediction_distribution = [
-        int(count)
-        for count in val_metrics["malignant"]["prediction_distribution"]
-    ]
+    if val_metrics is None:
+        prediction_distribution = None
+    else:
+        prediction_distribution = [
+            int(count)
+            for count in val_metrics["malignant"]["prediction_distribution"]
+        ]
     passed = (
         final_accuracy >= 0.98
         and math.isfinite(final_loss)
+        and prediction_distribution is not None
         and len(prediction_distribution) == 4
         and all(count > 0 for count in prediction_distribution)
     )
@@ -612,7 +625,7 @@ def _raise_overfit_gate_failure(result):
     )
 
 
-def assert_overfit_gate(overfit_samples, history, val_metrics):
+def assert_overfit_gate(overfit_samples, history, val_metrics=None):
     """检查最终训练准确率、损失有限性和四类预测完整性。"""
     result = build_overfit_gate_result(
         overfit_samples,
@@ -624,7 +637,12 @@ def assert_overfit_gate(overfit_samples, history, val_metrics):
     return result
 
 
-def enforce_overfit_gate(output_dir, overfit_samples, history, val_metrics):
+def enforce_overfit_gate(
+    output_dir,
+    overfit_samples,
+    history,
+    val_metrics=None,
+):
     """持久化门禁结论，并在失败结论写盘后抛出异常。"""
     result = build_overfit_gate_result(
         overfit_samples,
@@ -635,6 +653,36 @@ def enforce_overfit_gate(output_dir, overfit_samples, history, val_metrics):
     if not result["passed"]:
         _raise_overfit_gate_failure(result)
     return result
+
+
+def validate_overfit_64_prerequisite(args):
+    """仅允许已通过匹配 32 例门禁的配置进入 64 例训练。"""
+    if args.task_mode != "overfit" or args.overfit_samples != 64:
+        return
+
+    output_root = Path(args.output_root)
+    if output_root.exists():
+        for run_dir in output_root.glob("overfit_*"):
+            args_path = run_dir / "args.json"
+            gate_path = run_dir / "overfit_gate.json"
+            if not args_path.is_file() or not gate_path.is_file():
+                continue
+            try:
+                saved_args = json.loads(args_path.read_text(encoding="utf-8"))
+                gate = json.loads(gate_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (
+                gate.get("passed") is True
+                and gate.get("sample_count") == 32
+                and saved_args.get("seed") == args.seed
+                and saved_args.get("pretrained_path") == args.pretrained_path
+                and saved_args.get("img_size") == args.img_size
+            ):
+                return
+    raise ValueError(
+        "运行 64 例过拟合门禁前，必须先使用相同 seed、预训练权重和图像尺寸通过 32 例门禁"
+    )
 
 
 def _multimodal_dataset(samples, split, args, augment=False):
@@ -760,6 +808,8 @@ def main(args):
             canonical_splits,
         )
 
+    validate_overfit_64_prerequisite(args)
+
     canonical_splits = build_fair_splits(
         PROJECT_ROOT,
         args.task_mode,
@@ -847,6 +897,22 @@ def main(args):
             max_grad_norm=args.max_grad_norm,
             accum_steps=args.accum_steps,
         )
+        if (
+            args.task_mode == "overfit"
+            and not math.isfinite(float(train_metrics["total_loss"]))
+        ):
+            history.append({
+                "epoch": epoch,
+                "train": train_metrics,
+                "malignant_val": None,
+                "binary_val": None,
+                "score": None,
+            })
+            enforce_overfit_gate(
+                output_dir,
+                args.overfit_samples,
+                history,
+            )
         last_val_metrics = evaluate_loader(
             model,
             (
@@ -882,17 +948,6 @@ def main(args):
             "binary_val": binary_val_metrics,
             "score": score,
         })
-        if (
-            args.task_mode == "overfit"
-            and not math.isfinite(float(train_metrics["total_loss"]))
-        ):
-            enforce_overfit_gate(
-                output_dir,
-                args.overfit_samples,
-                history,
-                last_val_metrics,
-            )
-
         if score > best_score:
             best_score = score
             patience_counter = 0

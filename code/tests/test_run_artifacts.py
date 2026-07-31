@@ -844,11 +844,9 @@ def test_main_persists_failed_gate_before_strict_history_rejects_nan(
     monkeypatch.setattr(
         train_stage2_module,
         "evaluate_loader",
-        lambda *args, **kwargs: {
-            "malignant": {
-                "prediction_distribution": [8, 8, 8, 8],
-            }
-        },
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("非有限训练损失时不应先执行评估")
+        ),
     )
     args = build_parser().parse_args([
         "--pretrained_path",
@@ -874,6 +872,62 @@ def test_main_persists_failed_gate_before_strict_history_rejects_nan(
     assert payload["sample_count"] == 32
     assert payload["final_accuracy"] == 1.0
     assert payload["final_total_loss"] == "nan"
-    assert payload["prediction_distribution"] == [8, 8, 8, 8]
+    assert payload["prediction_distribution"] is None
     assert not (run_dirs[0] / "history.json").exists()
     _assert_chinese_value_error(error)
+
+
+def test_checkpoint_configuration_rejects_missing_split_metadata(tmp_path):
+    """历史检查点缺少划分元数据时必须拒绝复评。"""
+    checkpoint_path = tmp_path / "best_model.pth"
+    checkpoint_path.touch()
+    save_json(tmp_path / "args.json", {"task_mode": "flat4"})
+    save_json(tmp_path / "split_manifest.json", {
+        "task_mode": "flat4",
+        "splits": {},
+    })
+    args = _checkpoint_cli_args(checkpoint_path)
+
+    with pytest.raises(ValueError) as error:
+        train_stage2_module.load_checkpoint_run_configuration(args)
+
+    assert "malignant_metadata" in str(error.value)
+    _assert_chinese_value_error(error)
+
+
+def test_overfit_64_requires_matching_successful_32_gate(tmp_path):
+    """64 例门禁必须由同配置的 32 例成功记录解锁。"""
+    args = build_parser().parse_args([
+        "--pretrained_path", "TinyUSFM.pth", "--task_mode", "overfit",
+        "--overfit_samples", "64", "--seed", "42", "--output_root", str(tmp_path),
+    ])
+
+    with pytest.raises(ValueError) as error:
+        train_stage2_module.validate_overfit_64_prerequisite(args)
+
+    assert "32" in str(error.value)
+    _assert_chinese_value_error(error)
+
+
+def test_overfit_64_accepts_matching_successful_32_gate(tmp_path):
+    """匹配 seed、权重和图像尺寸的 32 例成功记录可以解锁 64 例。"""
+    run_dir = tmp_path / "overfit_20260731-120000"
+    run_dir.mkdir()
+    save_json(run_dir / "args.json", {
+        "seed": 42,
+        "pretrained_path": "TinyUSFM.pth",
+        "img_size": 224,
+    })
+    save_json(run_dir / "overfit_gate.json", {
+        "passed": True,
+        "sample_count": 32,
+        "final_accuracy": 1.0,
+        "final_total_loss": 0.0,
+        "prediction_distribution": [8, 8, 8, 8],
+    })
+    args = build_parser().parse_args([
+        "--pretrained_path", "TinyUSFM.pth", "--task_mode", "overfit",
+        "--overfit_samples", "64", "--seed", "42", "--output_root", str(tmp_path),
+    ])
+
+    train_stage2_module.validate_overfit_64_prerequisite(args)
