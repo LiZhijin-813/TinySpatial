@@ -63,4 +63,4 @@
 - `$env:WINDIR='C:\Windows'; D:\Program\Anocanda\envs\yolov8\python.exe -m pytest code/tests -q`
   - `202 passed, 2 warnings`
 
-本次修复提交哈希：`413e522b441390bad0815f3beb36a764a95ad856`
+本次代码与测试修复提交哈希：`678e86689da3e54e8a315f19fb624ea6af26e4fc`
