@@ -31,7 +31,7 @@
 
 ## 提交
 
-- 实现提交哈希：`bb52ee51bec1c62cca68ab03ac5dcdb475da94f4`
+- 初始实现提交哈希：`420b4768ac75923a1b528ec5badaa954138f5652`
 - 提交信息：`feat: 支持 flat5 平衡采样对照`
 
 ## 自检结论
@@ -45,3 +45,22 @@
 ## 顾虑
 
 全量测试仍受本机环境变量 `WINDIR` 缺失影响；目标测试文件全部通过。默认 Python 环境缺少 pytest，使用仓库可用的 Anaconda yolov8 环境完成测试。
+
+## 任务级审阅修复记录
+
+本次仅修改 `code/tests/test_run_artifacts.py` 与本报告文件：
+
+- 为默认 `flat5` 逆频率权重增加实际权重断言 `[0.4, 0.8, 1.0, 1.0, 0.8]`。
+- 增加未知 `flat5_class_weighting` 策略的中文 `ValueError` 测试。
+- 强化非 `flat5` 使用 `none` 的错误消息和中文断言。
+- 增加主训练最小透传测试：通过 monkeypatch 在准则构造后提前退出，只验证收到的策略为 `none`，未加载真实模型或数据。
+
+### TDD 与验证
+
+- 新增测试首次运行：`4 passed, 1 failed`；失败为测试夹具缺少既有划分清单所需的 `split` 字段，修正夹具后重新运行通过。
+- `D:\Program\Anocanda\envs\yolov8\python.exe -m pytest code/tests/test_run_artifacts.py -q`
+  - `73 passed, 2 warnings`
+- `$env:WINDIR='C:\Windows'; D:\Program\Anocanda\envs\yolov8\python.exe -m pytest code/tests -q`
+  - `202 passed, 2 warnings`
+
+本次修复提交哈希：`413e522b441390bad0815f3beb36a764a95ad856`

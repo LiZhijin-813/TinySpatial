@@ -277,6 +277,12 @@ def test_cli_defaults_to_reliable_flat4_configuration():
 def test_flat5_cli_defaults_to_inverse_class_weighting():
     args = build_parser().parse_args(["--pretrained_path", "TinyUSFM.pth"])
     assert args.flat5_class_weighting == "inverse"
+    criteria = build_criteria_for_mode(
+        "flat5", _criterion_samples(), torch.device("cpu")
+    )
+    assert criteria["class"].weight.tolist() == pytest.approx(
+        [0.4, 0.8, 1.0, 1.0, 0.8]
+    )
 
 
 def test_flat5_unweighted_criterion_has_no_class_weights():
@@ -292,8 +298,81 @@ def test_non_flat5_rejects_flat5_unweighted_strategy():
         "--pretrained_path", "TinyUSFM.pth", "--task_mode", "flat4",
         "--flat5_class_weighting", "none",
     ])
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as error:
         validate_reliable_configuration(args)
+    assert "flat5_class_weighting" in str(error.value)
+    _assert_chinese_value_error(error)
+
+
+def test_unknown_flat5_class_weighting_strategy_is_rejected():
+    with pytest.raises(ValueError) as error:
+        build_criteria_for_mode(
+            "flat5",
+            _criterion_samples(),
+            torch.device("cpu"),
+            flat5_class_weighting="unknown",
+        )
+    assert "flat5_class_weighting" in str(error.value)
+    _assert_chinese_value_error(error)
+
+
+def test_main_forwards_flat5_class_weighting_before_training(
+    tmp_path,
+    monkeypatch,
+):
+    received = []
+    samples = [{
+        "case_id": "case-1",
+        "class_label": 0,
+        "split": "train",
+    }]
+
+    monkeypatch.setattr(
+        train_stage2_module,
+        "build_fair_splits",
+        lambda *args, **kwargs: {"train": samples},
+    )
+    monkeypatch.setattr(
+        train_stage2_module,
+        "_multimodal_dataset",
+        lambda samples, *args, **kwargs: Namespace(samples=samples),
+    )
+    monkeypatch.setattr(
+        train_stage2_module,
+        "_build_evaluation_loaders",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        train_stage2_module,
+        "build_train_loader",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        train_stage2_module,
+        "build_model",
+        lambda *args, **kwargs: object(),
+    )
+
+    def fake_build_criteria(*args, **kwargs):
+        received.append(kwargs["flat5_class_weighting"])
+        raise RuntimeError("测试在构造准则后提前退出")
+
+    monkeypatch.setattr(
+        train_stage2_module,
+        "build_criteria_for_mode",
+        fake_build_criteria,
+    )
+    args = build_parser().parse_args([
+        "--pretrained_path", "TinyUSFM.pth",
+        "--task_mode", "flat5",
+        "--flat5_class_weighting", "none",
+        "--output_root", str(tmp_path),
+    ])
+
+    with pytest.raises(RuntimeError, match="提前退出"):
+        train_stage2_module.main(args)
+
+    assert received == ["none"]
 
 
 @pytest.mark.parametrize("flag", ["--no_augment", "--no-augment"])
