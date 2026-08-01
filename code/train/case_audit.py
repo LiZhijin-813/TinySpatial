@@ -185,7 +185,7 @@ def _error_type(conditional_correct, end_to_end_label):
 
 def _assert_reproducible(saved, actual, path="malignant"):
     """以严格容差递归确认保存指标可由记录精确复现。"""
-    if not saved:
+    if saved is None or (isinstance(saved, dict) and not saved):
         raise ValueError("无法复现：保存的 malignant 指标区域不能为空")
     if isinstance(saved, dict):
         if not isinstance(actual, dict) or set(saved) != set(actual):

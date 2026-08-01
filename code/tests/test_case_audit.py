@@ -24,7 +24,7 @@ def _records():
         torch.tensor(
             [
                 [4.0, 1.0, 0.0, -1.0, -2.0],
-                [0.0, 3.0, 2.0, -1.0, -2.0],
+                [3.0, 0.0, 2.0, -1.0, -2.0],
                 [0.0, 1.0, 2.0, -1.0, 5.0],
             ]
         ),
@@ -58,7 +58,7 @@ def test_build_case_records_preserves_order_and_audits_error_types():
         "恶性病例预测为良性",
     ]
     assert records[0]["true_subtype_name"] == "Luminal A"
-    assert records[1]["conditional_predicted_subtype_name"] == "Luminal B"
+    assert records[1]["conditional_predicted_subtype_name"] == "Luminal A"
     assert records[2]["end_to_end_predicted_class_name"] == "良性"
 
 

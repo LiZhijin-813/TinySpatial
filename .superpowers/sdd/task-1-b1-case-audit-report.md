@@ -42,3 +42,24 @@ git -c safe.directory='D:/Project/TinySpatial' diff --check
 ## 自审结论与疑虑
 
 代码仅新增任务指定的两个代码/测试文件，另新增本报告；未创建命令行入口，未运行远端实验，未改动训练脚本或其他文档。主要疑虑是本地解释器缺少 `torch`，导致无法完成 pytest 运行验证；此外，受限环境阻止 `py_compile` 写入缓存文件。
+
+## 远端失败修复
+
+远端执行 `pytest code/tests/test_case_audit.py -q` 的失败结果为 `3 failed, 9 passed`。
+
+根因一：测试夹具第二例真实标签为 `1`（Luminal B），而前四个 logits 为 `[0.0, 3.0, 2.0, -1.0]`，条件四分类 argmax 同样为 `1`。该例实际上是正确预测，却错误地期望“亚型错分”。现将 logits 改为 `[3.0, 0.0, 2.0, -1.0]`，使条件预测为 `0`（Luminal A），真实覆盖错分语义。
+
+根因二：`_assert_reproducible` 使用 `if not saved` 判断缺失，递归到 `malignant.per_class.TNBC.recall` 的合法浮点值 `0.0` 时被误判为空。现只将 `None` 或空映射视为缺失，数值零继续参与有限性与 `1e-12` 容差比较。
+
+修复后本机执行：
+
+```powershell
+pytest code/tests/test_case_audit.py -q
+```
+
+仍在收集阶段因环境缺少 `torch` 报 `ModuleNotFoundError`，未执行测试，因此不声明 pytest 通过。以下检查通过：
+
+```powershell
+py -3.10 -c "import ast; from pathlib import Path; [ast.parse(path.read_text(encoding='utf-8')) for path in (Path('code/train/case_audit.py'), Path('code/tests/test_case_audit.py'))]"
+git -c safe.directory='D:/Project/TinySpatial' diff --check
+```
