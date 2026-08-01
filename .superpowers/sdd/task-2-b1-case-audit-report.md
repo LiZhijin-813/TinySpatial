@@ -66,3 +66,20 @@ D:\Program\Anocanda\envs\yolov8\python.exe -m pytest code/tests/test_case_audit.
 修复提交：`bdc2d92`，提交说明：`test: 修复病例审计指标复现测试`。
 
 最新疑虑仅为仓库 `.pytest_cache` 的写入权限会产生缓存警告；病例审计测试本身已在指定解释器中完整通过。
+
+## 直接脚本入口修复
+
+直接执行 `code/train/audit_stage2.py` 时，解释器首先将 `code/train` 放入模块搜索路径，标准库 `code` 因而遮蔽项目的 `code` 包。项目包导入在参数解析前失败，错误为“`code` 不是包”。
+
+修复在 `audit_stage2.py` 的项目包导入前定义项目根目录、将其插入模块搜索路径首位，并在已加载的同名模块不是包时移除该模块。实现沿用 `train_stage2.py` 与 `inference.py` 的既有引导模式；从训练模块导入的同名项目根目录常量已移除。
+
+新增子进程回归测试直接执行审计脚本的 `--help`，不读取真实模型或数据，并断言项目 `code` 包可被正确解析。
+
+```powershell
+D:\Program\Anocanda\envs\yolov8\python.exe code/train/audit_stage2.py --help
+D:\Program\Anocanda\envs\yolov8\python.exe -m pytest code/tests/test_case_audit.py -q
+```
+
+实际结果：直接脚本帮助命令退出码为 0；完整病例审计测试为 `27 passed, 3 warnings in 7.45s`。警告仍仅涉及 `.pytest_cache` 无写入权限。
+
+修复提交：`3b06429`，提交说明：`fix: 修复病例审计脚本导入路径`。
