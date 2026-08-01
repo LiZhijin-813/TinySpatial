@@ -49,4 +49,20 @@ git diff --check
 
 自审确认公共接口齐全，输出由任务 1 的公开接口统一生成，且新模块未复制指标、CSV、JSON 或 Markdown 的领域逻辑。输入运行产物仅读取，审计输出不含原始图像或原始文本。
 
-主要疑虑是本地环境缺少 `torch`，导致无法执行 pytest 以获得运行时证据；静态语法和差异检查不能替代完整测试。报告提交与实现提交分开，以便报告记录实现提交的确切哈希。
+初始环境的主要疑虑是本地默认解释器缺少 `torch`，导致无法执行 pytest 以获得运行时证据；静态语法和差异检查不能替代完整测试。报告提交与实现提交分开，以便报告记录实现提交的确切哈希。
+
+## 本机真实测试修复
+
+使用 `D:\Program\Anocanda\envs\yolov8\python.exe` 执行真实测试后，发现 `test_run_case_audit_propagates_task1_metric_reproduction_failure` 初始失败。根因是测试默认清单的恶性测试病例顺序为 `[病例-B, 病例-A]`，但该测试的 canonical 样本和 mock 批次只有 `病例-A`；恢复划分先因未知病例而失败，尚未到达任务 1 的指标复现校验。
+
+修复仅修改 `code/tests/test_case_audit.py`：将 canonical 样本和 mock 批次统一为与清单完全一致的 `[病例-B, 病例-A]`，并保留故意不完整的保存指标。测试现在会经过清单恢复，进入任务 1 指标复现失败路径，并确认审计目录没有写入产物。
+
+```powershell
+D:\Program\Anocanda\envs\yolov8\python.exe -m pytest code/tests/test_case_audit.py -q
+```
+
+实际结果：`26 passed, 3 warnings in 2.73s`。三条警告均为 `.pytest_cache` 无写入权限导致的 pytest 缓存警告，不影响测试执行结果。
+
+修复提交：`bdc2d92`，提交说明：`test: 修复病例审计指标复现测试`。
+
+最新疑虑仅为仓库 `.pytest_cache` 的写入权限会产生缓存警告；病例审计测试本身已在指定解释器中完整通过。
