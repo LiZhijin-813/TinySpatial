@@ -31,6 +31,25 @@ py -3.10 -m py_compile code/train/case_audit.py code/tests/test_case_audit.py
 git -c safe.directory='D:/Project/TinySpatial' diff --check
 ```
 
+## 审阅 P1/P2 修复
+
+P1 根因：公开 `write_audit_outputs` 之前自行创建输出目录，未调用 `validate_output_directory`，使直接调用能够在非空目录写入固定产物文件。现增加 `overwrite=False` 公开参数，并在写入前统一调用目录校验；默认拒绝非空目录，显式 `overwrite=True` 才允许写入。测试新增直接写入非空目录拒绝和显式覆盖允许两种行为。
+
+P2 根因：新增异常文本曾直接展示内部英文键名。现将病例记录、保存指标、恶性病例指标、分类分数、亚型标签和模态存在性等异常用户提示全部改为中文表达；新增测试确认缺失保存指标异常不暴露英文内部字段名。
+
+本机本次仍执行：
+
+```powershell
+pytest code/tests/test_case_audit.py -q
+```
+
+结果仍在测试收集阶段因缺少 `torch` 报 `ModuleNotFoundError`，因此未声明 pytest 通过。以下静态检查通过：
+
+```powershell
+py -3.10 -c "import ast; from pathlib import Path; [ast.parse(path.read_text(encoding='utf-8')) for path in (Path('code/train/case_audit.py'), Path('code/tests/test_case_audit.py'))]"
+git -c safe.directory='D:/Project/TinySpatial' diff --check
+```
+
 `py_compile` 因工作区 `__pycache__` 写入权限不足未能完成；`git diff --check` 未报告空白错误。
 
 ## 提交

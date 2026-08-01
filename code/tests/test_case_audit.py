@@ -116,6 +116,32 @@ def test_validate_output_directory_rejects_nonempty_directory_unless_overwritten
     assert validate_output_directory(output_dir, overwrite=True) == output_dir
 
 
+def test_write_audit_outputs_rejects_nonempty_directory_unless_overwritten(tmp_path):
+    """公开写入接口必须拒绝非空目录，只有显式覆盖时才允许写入。"""
+    output_dir = tmp_path / "审计"
+    output_dir.mkdir()
+    (output_dir / "已有.txt").write_text("内容", encoding="utf-8")
+    records = _records()
+    summary = build_audit_summary(records, _saved_metrics(records))
+
+    with pytest.raises(ValueError, match="[\u4e00-\u9fff]"):
+        write_audit_outputs(output_dir, records, summary)
+
+    write_audit_outputs(output_dir, records, summary, overwrite=True)
+
+    assert (output_dir / "case_predictions.csv").exists()
+
+
+def test_build_audit_summary_uses_chinese_error_for_missing_saved_metrics():
+    """公开异常不得暴露英文保存指标或恶性区域内部字段名。"""
+    with pytest.raises(ValueError) as error:
+        build_audit_summary(_records(), {})
+
+    assert "保存指标" in str(error.value)
+    assert "saved_metrics" not in str(error.value)
+    assert "malignant" not in str(error.value)
+
+
 def test_write_audit_outputs_writes_three_files_and_no_high_confidence_branch(tmp_path):
     """审计产物必须按记录顺序写 CSV，并说明无高置信度错分。"""
     records = _records()
