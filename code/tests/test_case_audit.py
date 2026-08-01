@@ -379,17 +379,20 @@ def test_run_case_audit_rejects_invalid_batch_size_and_unavailable_cuda(tmp_path
 def test_run_case_audit_propagates_task1_metric_reproduction_failure(tmp_path, monkeypatch):
     """任务 1 的指标复现失败必须阻止任何审计产物写入。"""
     _flat5_run(tmp_path, metrics={"malignant": {"accuracy": 0.0}})
-    canonical = {"malignant_test": [{"case_id": "病例-A", "subtype_label": 0}]}
+    canonical = {"malignant_test": [
+        {"case_id": "病例-B", "subtype_label": 0},
+        {"case_id": "病例-A", "subtype_label": 0},
+    ]}
     monkeypatch.setattr(audit_stage2_module, "MultiModalBreastDataset", _AuditDataset)
     monkeypatch.setattr(audit_stage2_module, "build_fair_splits", lambda *args, **kwargs: canonical)
     monkeypatch.setattr(audit_stage2_module, "build_eval_loader", lambda dataset, args: [{
-        "case_id": ["病例-A"],
-        "bus_img": torch.zeros(1, 1, 2, 2),
-        "swe_img": torch.zeros(1, 3, 2, 2),
-        "cdfi_img": torch.zeros(1, 3, 2, 2),
-        "input_ids": torch.zeros(1, 3, dtype=torch.long),
-        "attention_mask": torch.ones(1, 3, dtype=torch.long),
-        "subtype_label": torch.zeros(1, dtype=torch.long),
+        "case_id": ["病例-B", "病例-A"],
+        "bus_img": torch.zeros(2, 1, 2, 2),
+        "swe_img": torch.zeros(2, 3, 2, 2),
+        "cdfi_img": torch.zeros(2, 3, 2, 2),
+        "input_ids": torch.zeros(2, 3, dtype=torch.long),
+        "attention_mask": torch.ones(2, 3, dtype=torch.long),
+        "subtype_label": torch.zeros(2, dtype=torch.long),
     }])
     monkeypatch.setattr(audit_stage2_module, "build_model", lambda *args, **kwargs: _AuditModel())
 
