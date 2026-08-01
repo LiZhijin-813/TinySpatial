@@ -274,6 +274,28 @@ def test_cli_defaults_to_reliable_flat4_configuration():
     assert args.label_smoothing == 0.0
 
 
+def test_flat5_cli_defaults_to_inverse_class_weighting():
+    args = build_parser().parse_args(["--pretrained_path", "TinyUSFM.pth"])
+    assert args.flat5_class_weighting == "inverse"
+
+
+def test_flat5_unweighted_criterion_has_no_class_weights():
+    criteria = build_criteria_for_mode(
+        "flat5", _criterion_samples(), torch.device("cpu"),
+        flat5_class_weighting="none",
+    )
+    assert criteria["class"].weight is None
+
+
+def test_non_flat5_rejects_flat5_unweighted_strategy():
+    args = build_parser().parse_args([
+        "--pretrained_path", "TinyUSFM.pth", "--task_mode", "flat4",
+        "--flat5_class_weighting", "none",
+    ])
+    with pytest.raises(ValueError):
+        validate_reliable_configuration(args)
+
+
 @pytest.mark.parametrize("flag", ["--no_augment", "--no-augment"])
 def test_overfit_cli_accepts_both_no_augment_spellings(flag):
     """下划线和连字符写法必须汇聚到同一个 augment 字段。"""

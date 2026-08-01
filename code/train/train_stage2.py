@@ -113,6 +113,12 @@ def build_parser():
         help="训练任务模式",
     )
     parser.add_argument(
+        "--flat5_class_weighting",
+        choices=["inverse", "none"],
+        default="inverse",
+        help="flat5 五分类交叉熵类别权重策略",
+    )
+    parser.add_argument(
         "--malignant_metadata",
         default="metadata.csv",
         help="恶性病例元数据文件名",
@@ -263,6 +269,10 @@ def validate_reliable_configuration(args):
         )
     if args.task_mode != "overfit" and not args.eval_malignant_subset:
         raise ValueError("可靠基线必须评估固定恶性子集")
+    if args.task_mode != "flat5" and args.flat5_class_weighting == "none":
+        raise ValueError(
+            "flat5_class_weighting=none 仅允许 task_mode=flat5"
+        )
 
 
 def build_criteria_for_mode(
@@ -270,6 +280,7 @@ def build_criteria_for_mode(
     samples,
     device,
     label_smoothing=0.0,
+    flat5_class_weighting="inverse",
 ):
     """按任务标签空间构造彼此独立的交叉熵损失。"""
     if task_mode == "overfit":
@@ -288,12 +299,19 @@ def build_criteria_for_mode(
             )
         }
     if task_mode == "flat5":
-        weights = compute_class_weights(
-            samples,
-            "class_label",
-            5,
-            device=device,
-        )
+        if flat5_class_weighting == "inverse":
+            weights = compute_class_weights(
+                samples,
+                "class_label",
+                5,
+                device=device,
+            )
+        elif flat5_class_weighting == "none":
+            weights = None
+        else:
+            raise ValueError(
+                f"未知 flat5_class_weighting 策略：{flat5_class_weighting}"
+            )
         return {
             "class": nn.CrossEntropyLoss(
                 weight=weights,
@@ -869,6 +887,7 @@ def main(args):
         train_dataset.samples,
         device,
         label_smoothing=args.label_smoothing,
+        flat5_class_weighting=args.flat5_class_weighting,
     )
     if args.task_mode == "overfit":
         optimizer = torch.optim.AdamW(
