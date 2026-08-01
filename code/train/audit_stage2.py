@@ -2,7 +2,14 @@
 
 import argparse
 import json
+import sys
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+if "code" in sys.modules and not hasattr(sys.modules["code"], "__path__"):
+    del sys.modules["code"]
 
 import torch
 
@@ -14,7 +21,6 @@ from code.train.case_audit import (
     write_audit_outputs,
 )
 from code.train.train_stage2 import (
-    PROJECT_ROOT,
     build_eval_loader,
     build_fair_splits,
     build_model,

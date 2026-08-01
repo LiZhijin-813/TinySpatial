@@ -3,6 +3,8 @@
 import csv
 import json
 import math
+import subprocess
+import sys
 from argparse import Namespace
 from pathlib import Path
 
@@ -195,6 +197,20 @@ def test_audit_parser_exposes_required_run_and_optional_controls():
     assert args.overwrite is False
     with pytest.raises(SystemExit):
         parser.parse_args(["--run_dir", "运行目录", "--batch_size", "0"])
+
+
+def test_audit_script_help_prefers_project_code_package():
+    """直接执行审计脚本时必须优先解析项目 code 包。"""
+    result = subprocess.run(
+        [sys.executable, str(Path(audit_stage2_module.__file__)), "--help"],
+        cwd=audit_stage2_module.PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "flat5 恶性病例错误审计" in result.stdout
 
 
 @pytest.mark.parametrize(
