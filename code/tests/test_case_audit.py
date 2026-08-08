@@ -101,6 +101,7 @@ def test_build_audit_summary_reproduces_saved_malignant_metrics():
     summary = build_audit_summary(records, expected)
 
     assert summary["malignant"] == expected["malignant"]
+    assert summary["verify_saved_metrics"] is True
     assert summary["error_type_distribution"] == {"正确": 1, "亚型错分": 1, "恶性病例预测为良性": 1}
 
 
@@ -146,6 +147,20 @@ def test_build_audit_summary_rejects_unreproducible_saved_metrics():
     """保存指标与病例记录不一致时必须明确拒绝。"""
     with pytest.raises(ValueError, match="无法复现"):
         build_audit_summary(_records(), {"malignant": {"accuracy": 0.0}})
+
+
+def test_build_audit_summary_allows_metric_changes_when_skip_verification():
+    """显式关闭保存指标复现校验后，消融组的真实指标变化应当被允许。"""
+    summary = build_audit_summary(
+        _records(),
+        {"malignant": {"accuracy": 0.0}},
+        ablate_modalities=("bus",),
+        verify_saved_metrics=False,
+    )
+
+    assert summary["ablate_modalities"] == ["bus"]
+    assert summary["verify_saved_metrics"] is False
+    assert summary["malignant"] == _saved_metrics(_records())["malignant"]
 
 
 def test_validate_output_directory_rejects_nonempty_directory_unless_overwritten(tmp_path):
@@ -218,6 +233,7 @@ def _audit_args(run_dir, **overrides):
         "device": "cpu",
         "batch_size": None,
         "overwrite": False,
+        "skip_metric_reproduction": False,
     }
     values.update(overrides)
     return Namespace(**values)
@@ -234,6 +250,7 @@ def test_audit_parser_exposes_required_run_and_optional_controls():
     assert args.batch_size is None
     assert args.overwrite is False
     assert args.ablate_modalities == []
+    assert args.skip_metric_reproduction is False
     with pytest.raises(SystemExit):
         parser.parse_args(["--run_dir", "运行目录", "--batch_size", "0"])
 
@@ -249,6 +266,17 @@ def test_audit_parser_accepts_ablation_modalities():
     ])
 
     assert args.ablate_modalities == ["bus", "cdfi"]
+
+
+def test_audit_parser_accepts_skip_metric_reproduction():
+    """审计入口必须允许显式关闭保存指标复现校验。"""
+    args = audit_stage2_module.build_parser().parse_args([
+        "--run_dir",
+        "运行目录",
+        "--skip_metric_reproduction",
+    ])
+
+    assert args.skip_metric_reproduction is True
 
 
 def test_audit_script_help_prefers_project_code_package():
@@ -478,6 +506,38 @@ def test_run_case_audit_propagates_task1_metric_reproduction_failure(tmp_path, m
         audit_stage2_module.run_case_audit(_audit_args(tmp_path))
 
     assert not list((tmp_path / "case_audit").iterdir())
+
+
+def test_run_case_audit_allows_metric_change_when_skip_metric_reproduction(tmp_path, monkeypatch):
+    """显式跳过保存指标复现校验时，审计入口应输出真实消融指标和校验状态。"""
+    _flat5_run(tmp_path, metrics={"malignant": {"accuracy": 0.0}})
+    canonical = {"malignant_test": [
+        {"case_id": "病例-B", "subtype_label": 0},
+        {"case_id": "病例-A", "subtype_label": 0},
+    ]}
+    monkeypatch.setattr(audit_stage2_module, "MultiModalBreastDataset", _AuditDataset)
+    monkeypatch.setattr(audit_stage2_module, "build_fair_splits", lambda *args, **kwargs: canonical)
+    monkeypatch.setattr(audit_stage2_module, "build_eval_loader", lambda dataset, args: [{
+        "case_id": ["病例-B", "病例-A"],
+        "bus_img": torch.zeros(2, 1, 2, 2),
+        "swe_img": torch.zeros(2, 3, 2, 2),
+        "cdfi_img": torch.zeros(2, 3, 2, 2),
+        "input_ids": torch.zeros(2, 3, dtype=torch.long),
+        "attention_mask": torch.ones(2, 3, dtype=torch.long),
+        "subtype_label": torch.zeros(2, dtype=torch.long),
+    }])
+    monkeypatch.setattr(audit_stage2_module, "build_model", lambda *args, **kwargs: _AuditModel())
+
+    output_dir = audit_stage2_module.run_case_audit(
+        _audit_args(
+            tmp_path,
+            skip_metric_reproduction=True,
+        )
+    )
+
+    summary = json.loads((output_dir / "case_audit_summary.json").read_text(encoding="utf-8"))
+    assert summary["verify_saved_metrics"] is False
+    assert summary["ablate_modalities"] == []
 
 
 def test_write_audit_outputs_writes_three_files_and_no_high_confidence_branch(tmp_path):

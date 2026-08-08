@@ -59,8 +59,13 @@ def build_case_records(case_ids, subtype_labels, class_logits, modality_exists):
     return records
 
 
-def build_audit_summary(records, saved_metrics, ablate_modalities=None):
-    """复现并校验保存的恶性条件四分类指标，汇总病例错误。"""
+def build_audit_summary(
+    records,
+    saved_metrics,
+    ablate_modalities=None,
+    verify_saved_metrics=True,
+):
+    """汇总病例错误，并按需校验保存的恶性条件四分类指标能否被严格复现。"""
     if not isinstance(records, list) or not records:
         raise ValueError("病例记录必须是非空列表")
     if not isinstance(saved_metrics, dict) or not isinstance(saved_metrics.get("malignant"), dict):
@@ -74,7 +79,8 @@ def build_audit_summary(records, saved_metrics, ablate_modalities=None):
     saved_malignant = saved_metrics["malignant"]
     if isinstance(saved_malignant.get("malignant"), dict):
         saved_malignant = saved_malignant["malignant"]
-    _assert_reproducible(saved_malignant, malignant)
+    if verify_saved_metrics:
+        _assert_reproducible(saved_malignant, malignant)
     normalized_ablation = sorted(normalize_ablate_modalities(ablate_modalities))
     error_counts = {"正确": 0, "亚型错分": 0, "恶性病例预测为良性": 0}
     for record in records:
@@ -86,6 +92,7 @@ def build_audit_summary(records, saved_metrics, ablate_modalities=None):
         "source": "flat5 恶性病例条件四分类预测",
         "record_count": len(records),
         "ablate_modalities": normalized_ablation,
+        "verify_saved_metrics": bool(verify_saved_metrics),
         "malignant": malignant,
         "error_type_distribution": error_counts,
     }
@@ -244,6 +251,7 @@ def _render_markdown(records, summary):
         "# 病例级错误审计",
         "",
         f"来源：{summary['source']}。共纳入 {summary['record_count']} 例恶性病例。",
+        f"保存指标复现校验：{'已完成' if summary.get('verify_saved_metrics') else '已跳过'}。",
         "",
         "## 各真实亚型",
         "",

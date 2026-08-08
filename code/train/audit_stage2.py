@@ -58,6 +58,11 @@ def build_parser():
     parser.add_argument("--batch_size", type=_positive_integer, help="审计批次大小")
     parser.add_argument("--overwrite", action="store_true", help="允许覆盖非空审计目录")
     parser.add_argument(
+        "--skip_metric_reproduction",
+        action="store_true",
+        help="跳过保存指标复现校验，允许消融组输出真实病例审计指标",
+    )
+    parser.add_argument(
         "--ablate_modalities",
         nargs="*",
         choices=VALID_ABLATION_MODALITIES,
@@ -185,6 +190,7 @@ def run_case_audit(args):
         records,
         saved_metrics,
         ablate_modalities=getattr(args, "ablate_modalities", []),
+        verify_saved_metrics=not getattr(args, "skip_metric_reproduction", False),
     )
     write_audit_outputs(output_dir, records, summary, overwrite=args.overwrite)
     print(f"病例审计完成：共 {len(records)} 例，输出目录：{output_dir}")
