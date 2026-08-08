@@ -746,6 +746,85 @@ def _checkpoint_cli_args(checkpoint_path):
     ])
 
 
+def test_evaluate_checkpoint_uses_cli_ablation_modalities_for_dataset(
+    tmp_path,
+    monkeypatch,
+):
+    """检查点复评必须把当前命令行屏蔽列表传给数据集。"""
+    checkpoint_path = tmp_path / "best_model.pth"
+    checkpoint_path.touch()
+    save_json(tmp_path / "args.json", {
+        "task_mode": "flat4",
+        "img_size": 224,
+        "max_text_len": 128,
+        "malignant_metadata": "历史恶性.csv",
+        "benign_metadata": "历史良性.csv",
+        "ablate_modalities": ["bus"],
+    })
+    save_json(tmp_path / "split_manifest.json", {
+        "task_mode": "flat4",
+        "splits": {"malignant_test": ["病例-1"]},
+    })
+    captured = {}
+
+    def fake_dataset(
+        root_dir,
+        split,
+        img_size,
+        max_text_len,
+        samples,
+        augment,
+        ablate_modalities=None,
+    ):
+        captured["ablate_modalities"] = list(ablate_modalities or [])
+        captured["samples"] = samples
+        return Namespace(samples=samples)
+
+    monkeypatch.setattr(train_stage2_module, "MultiModalBreastDataset", fake_dataset)
+    monkeypatch.setattr(
+        train_stage2_module,
+        "build_model",
+        lambda args, device: Namespace(load_state_dict=lambda state: None),
+    )
+    monkeypatch.setattr(
+        train_stage2_module.torch,
+        "load",
+        lambda *args, **kwargs: {"model_state_dict": {}},
+    )
+    monkeypatch.setattr(
+        train_stage2_module,
+        "build_eval_loader",
+        lambda dataset, args: "评估加载器",
+    )
+    monkeypatch.setattr(
+        train_stage2_module,
+        "evaluate_loader",
+        lambda *args, **kwargs: {"malignant": {"macro_f1": 0.5}},
+    )
+    args = build_parser().parse_args([
+        "--pretrained_path",
+        "TinyUSFM.pth",
+        "--task_mode",
+        "flat4",
+        "--evaluate_checkpoint",
+        str(checkpoint_path),
+        "--eval_output",
+        str(tmp_path / "metrics_eval.json"),
+        "--ablate_modalities",
+        "swe",
+        "text",
+    ])
+
+    metrics = evaluate_checkpoint(
+        args,
+        torch.device("cpu"),
+        {"malignant_test": [{"case_id": "病例-1"}]},
+    )
+
+    assert metrics == {"malignant": {"macro_f1": 0.5}}
+    assert captured["ablate_modalities"] == ["swe", "text"]
+
+
 def test_checkpoint_main_builds_splits_from_saved_metadata(
     tmp_path,
     monkeypatch,

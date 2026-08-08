@@ -589,7 +589,7 @@ def evaluate_checkpoint(args, device, canonical_splits):
             max_text_len=model_args.max_text_len,
             samples=restored["malignant_test"],
             augment=False,
-            ablate_modalities=getattr(model_args, "ablate_modalities", []),
+            ablate_modalities=getattr(args, "ablate_modalities", []),
         )
     metrics = evaluate_loader(
         model,
