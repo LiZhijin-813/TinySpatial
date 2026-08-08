@@ -33,6 +33,7 @@ VALID_ABLATION_MODALITIES = ("bus", "swe", "cdfi", "text")
 
 
 def normalize_ablate_modalities(values):
+    """规范化模态消融集合，并拒绝未知模态名称。"""
     values = () if values is None else tuple(values)
     unknown = set(values) - set(VALID_ABLATION_MODALITIES)
     if unknown:
@@ -209,6 +210,7 @@ class MultiModalBreastDataset(Dataset):
             samples: 可选的显式样本序列；提供时不读取 metadata 文件
             augment: 是否启用随机增强；默认为 train 启用、val/test 禁用
             tokenizer: 可选的 tokenizer；未提供时按 tokenizer_name 加载
+            ablate_modalities: 要屏蔽的模态列表，可选 bus、swe、cdfi 或 text；默认为空集合，屏蔽后替换为零张量。
         """
         self.root_dir = root_dir
         self.split = split

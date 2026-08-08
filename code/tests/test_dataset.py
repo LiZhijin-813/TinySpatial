@@ -279,3 +279,8 @@ def test_dataset_ablation_zeroes_selected_modalities(
 def test_dataset_ablation_rejects_unknown_modalities(values):
     with pytest.raises(ValueError, match="未知模态"):
         normalize_ablate_modalities(values)
+
+
+@pytest.mark.parametrize("values", [None, []])
+def test_normalize_ablate_modalities_empty_values_return_empty_set(values):
+    assert normalize_ablate_modalities(values) == frozenset()
