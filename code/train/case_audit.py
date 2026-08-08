@@ -70,7 +70,10 @@ def build_audit_summary(records, saved_metrics):
     except (KeyError, TypeError) as error:
         raise ValueError("病例记录缺少条件四分类指标所需字段") from error
     malignant = evaluate_predictions(y_true, y_pred, SUBTYPE_NAMES)
-    _assert_reproducible(saved_metrics["malignant"], malignant)
+    saved_malignant = saved_metrics["malignant"]
+    if isinstance(saved_malignant.get("malignant"), dict):
+        saved_malignant = saved_malignant["malignant"]
+    _assert_reproducible(saved_malignant, malignant)
     error_counts = {"正确": 0, "亚型错分": 0, "恶性病例预测为良性": 0}
     for record in records:
         error_type = record.get("error_type")

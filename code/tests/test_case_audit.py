@@ -104,6 +104,24 @@ def test_build_audit_summary_reproduces_saved_malignant_metrics():
     assert summary["error_type_distribution"] == {"正确": 1, "亚型错分": 1, "恶性病例预测为良性": 1}
 
 
+def test_build_audit_summary_accepts_stage2_test_metrics_envelope():
+    """审计汇总应支持训练阶段保存的分区嵌套指标格式。"""
+    records = _records()
+    expected = _saved_metrics(records)
+    wrapped_metrics = {
+        "malignant": {
+            "malignant": expected["malignant"],
+            "malignant_end_to_end": {"macro_f1": 0.0},
+            "diagnostic": {"logits_var": 0.0},
+        },
+        "binary": None,
+    }
+
+    summary = build_audit_summary(records, wrapped_metrics)
+
+    assert summary["malignant"] == expected["malignant"]
+
+
 def test_build_audit_summary_rejects_unreproducible_saved_metrics():
     """保存指标与病例记录不一致时必须明确拒绝。"""
     with pytest.raises(ValueError, match="无法复现"):
