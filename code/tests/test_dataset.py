@@ -9,6 +9,7 @@ from code.datasets.dataset import (
     MultiModalBreastDataset,
     PairedAlignedTransform,
     PairedEvaluationTransform,
+    normalize_ablate_modalities,
 )
 from code.datasets.bus_dataset import BUSOverfitDataset
 
@@ -243,3 +244,38 @@ def test_dataset_reads_mismatched_paired_sizes_after_normalization(
 
     assert sample["bus_img"].shape == (1, 224, 224)
     assert sample["swe_img"].shape == (3, 224, 224)
+
+
+def test_dataset_ablation_zeroes_selected_modalities(
+    tiny_multimodal_root,
+    fake_tokenizer,
+):
+    root, samples = tiny_multimodal_root
+    full = MultiModalBreastDataset(
+        str(root),
+        split="val",
+        samples=[samples[0]],
+        augment=False,
+        tokenizer=fake_tokenizer,
+    )[0]
+    ablated = MultiModalBreastDataset(
+        str(root),
+        split="val",
+        samples=[samples[0]],
+        augment=False,
+        tokenizer=fake_tokenizer,
+        ablate_modalities=["swe", "text"],
+    )[0]
+
+    assert torch.count_nonzero(ablated["bus_img"]) > 0
+    assert torch.count_nonzero(ablated["cdfi_img"]) > 0
+    assert torch.count_nonzero(ablated["swe_img"]) == 0
+    assert torch.count_nonzero(ablated["input_ids"]) == 0
+    assert torch.count_nonzero(ablated["attention_mask"]) == 0
+    assert torch.count_nonzero(full["swe_img"]) > 0
+
+
+@pytest.mark.parametrize("values", [["unknown"], ["bus", "unknown"]])
+def test_dataset_ablation_rejects_unknown_modalities(values):
+    with pytest.raises(ValueError, match="未知模态"):
+        normalize_ablate_modalities(values)

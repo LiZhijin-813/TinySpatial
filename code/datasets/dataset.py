@@ -29,6 +29,17 @@ import numpy as np
 from transformers import AutoTokenizer
 
 
+VALID_ABLATION_MODALITIES = ("bus", "swe", "cdfi", "text")
+
+
+def normalize_ablate_modalities(values):
+    values = () if values is None else tuple(values)
+    unknown = set(values) - set(VALID_ABLATION_MODALITIES)
+    if unknown:
+        raise ValueError(f"未知模态：{sorted(unknown)}")
+    return frozenset(values)
+
+
 def _normalize_labels(sample: Dict) -> Dict:
     """统一恶性和良性样本的三类标签语义。"""
     subtype_label = int(sample["subtype_label"])
@@ -183,6 +194,7 @@ class MultiModalBreastDataset(Dataset):
         samples: Optional[List[Dict]] = None,
         augment: Optional[bool] = None,
         tokenizer=None,
+        ablate_modalities=None,
     ):
         """
         Args:
@@ -202,6 +214,7 @@ class MultiModalBreastDataset(Dataset):
         self.split = split
         self.img_size = img_size
         self.max_text_len = max_text_len
+        self.ablate_modalities = normalize_ablate_modalities(ablate_modalities)
 
         # 各模态数据目录
         self.data_dir = os.path.join(root_dir, "data")
@@ -313,13 +326,26 @@ class MultiModalBreastDataset(Dataset):
             return_tensors="pt",
         )
 
+        if "bus" in self.ablate_modalities:
+            bus_tensor = torch.zeros_like(bus_tensor)
+        if "swe" in self.ablate_modalities:
+            swe_tensor = torch.zeros_like(swe_tensor)
+        if "cdfi" in self.ablate_modalities:
+            cdfi_tensor = torch.zeros_like(cdfi_tensor)
+        if "text" in self.ablate_modalities:
+            input_ids = torch.zeros_like(encoding["input_ids"].squeeze(0))
+            attention_mask = torch.zeros_like(encoding["attention_mask"].squeeze(0))
+        else:
+            input_ids = encoding["input_ids"].squeeze(0)
+            attention_mask = encoding["attention_mask"].squeeze(0)
+
         return {
             "case_id": case_id,
             "bus_img": bus_tensor,
             "swe_img": swe_tensor,
             "cdfi_img": cdfi_tensor,
-            "input_ids": encoding["input_ids"].squeeze(0),
-            "attention_mask": encoding["attention_mask"].squeeze(0),
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
             "class_label": sample["class_label"],
             "malignancy_label": sample["malignancy_label"],
             "subtype_label": sample["subtype_label"],
