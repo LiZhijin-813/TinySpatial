@@ -104,6 +104,26 @@ def test_build_audit_summary_reproduces_saved_malignant_metrics():
     assert summary["error_type_distribution"] == {"正确": 1, "亚型错分": 1, "恶性病例预测为良性": 1}
 
 
+def test_build_audit_summary_defaults_ablation_modalities_to_empty_list():
+    """病例审计汇总默认必须写出空的屏蔽模态列表。"""
+    records = _records()
+    summary = build_audit_summary(records, _saved_metrics(records))
+
+    assert summary["ablate_modalities"] == []
+
+
+def test_build_audit_summary_saves_sorted_ablation_modalities():
+    """病例审计汇总必须保存排序后的规范化屏蔽模态列表。"""
+    records = _records()
+    summary = build_audit_summary(
+        records,
+        _saved_metrics(records),
+        ablate_modalities=("text", "swe", "text"),
+    )
+
+    assert summary["ablate_modalities"] == ["swe", "text"]
+
+
 def test_build_audit_summary_accepts_stage2_test_metrics_envelope():
     """审计汇总应支持训练阶段保存的分区嵌套指标格式。"""
     records = _records()
@@ -213,8 +233,22 @@ def test_audit_parser_exposes_required_run_and_optional_controls():
     assert args.device == "cuda:0"
     assert args.batch_size is None
     assert args.overwrite is False
+    assert args.ablate_modalities == []
     with pytest.raises(SystemExit):
         parser.parse_args(["--run_dir", "运行目录", "--batch_size", "0"])
+
+
+def test_audit_parser_accepts_ablation_modalities():
+    """审计入口必须接受零个或多个待屏蔽模态。"""
+    args = audit_stage2_module.build_parser().parse_args([
+        "--run_dir",
+        "杩愯鐩綍",
+        "--ablate_modalities",
+        "bus",
+        "cdfi",
+    ])
+
+    assert args.ablate_modalities == ["bus", "cdfi"]
 
 
 def test_audit_script_help_prefers_project_code_package():
@@ -259,12 +293,22 @@ def test_load_flat5_audit_run_rejects_incomplete_or_invalid_saved_artifacts(tmp_
 class _AuditDataset(torch.utils.data.Dataset):
     """不访问真实数据的确定性审计数据集替身。"""
 
-    def __init__(self, root_dir, split, img_size, max_text_len, samples, augment):
+    def __init__(
+        self,
+        root_dir,
+        split,
+        img_size,
+        max_text_len,
+        samples,
+        augment,
+        ablate_modalities=None,
+    ):
         assert root_dir == audit_stage2_module.PROJECT_ROOT
         assert split == "test"
         assert img_size == 2
         assert max_text_len == 3
         assert augment is False
+        assert list(ablate_modalities or []) == []
         self.samples = [dict(sample) for sample in samples]
         self.bus_dir = Path(root_dir) / "data" / "images" / "BUS"
         self.swe_dir = Path(root_dir) / "data" / "images" / "SWE"

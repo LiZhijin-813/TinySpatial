@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from code.datasets.dataset import normalize_ablate_modalities
 from code.train.run_artifacts import save_json
 from code.utils.evaluation import SUBTYPE_NAMES, evaluate_predictions
 
@@ -58,7 +59,7 @@ def build_case_records(case_ids, subtype_labels, class_logits, modality_exists):
     return records
 
 
-def build_audit_summary(records, saved_metrics):
+def build_audit_summary(records, saved_metrics, ablate_modalities=None):
     """复现并校验保存的恶性条件四分类指标，汇总病例错误。"""
     if not isinstance(records, list) or not records:
         raise ValueError("病例记录必须是非空列表")
@@ -74,6 +75,7 @@ def build_audit_summary(records, saved_metrics):
     if isinstance(saved_malignant.get("malignant"), dict):
         saved_malignant = saved_malignant["malignant"]
     _assert_reproducible(saved_malignant, malignant)
+    normalized_ablation = sorted(normalize_ablate_modalities(ablate_modalities))
     error_counts = {"正确": 0, "亚型错分": 0, "恶性病例预测为良性": 0}
     for record in records:
         error_type = record.get("error_type")
@@ -83,6 +85,7 @@ def build_audit_summary(records, saved_metrics):
     return {
         "source": "flat5 恶性病例条件四分类预测",
         "record_count": len(records),
+        "ablate_modalities": normalized_ablation,
         "malignant": malignant,
         "error_type_distribution": error_counts,
     }

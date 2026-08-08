@@ -21,7 +21,10 @@ if "code" in sys.modules and not hasattr(sys.modules["code"], "__path__"):
     del sys.modules["code"]
 
 from code.datasets.bus_dataset import BUSOverfitDataset
-from code.datasets.dataset import MultiModalBreastDataset
+from code.datasets.dataset import (
+    MultiModalBreastDataset,
+    VALID_ABLATION_MODALITIES,
+)
 from code.datasets.split_utils import (
     build_fair_splits,
     build_split_manifest,
@@ -250,6 +253,13 @@ def build_parser():
         "--output_root",
         default="runs/stage2",
         help="运行产物根目录",
+    )
+    parser.add_argument(
+        "--ablate_modalities",
+        nargs="*",
+        choices=VALID_ABLATION_MODALITIES,
+        default=[],
+        help="实验时屏蔽的模态列表",
     )
     parser.set_defaults(augment=None, eval_malignant_subset=True)
     return parser
@@ -579,6 +589,7 @@ def evaluate_checkpoint(args, device, canonical_splits):
             max_text_len=model_args.max_text_len,
             samples=restored["malignant_test"],
             augment=False,
+            ablate_modalities=getattr(model_args, "ablate_modalities", []),
         )
     metrics = evaluate_loader(
         model,
@@ -712,6 +723,7 @@ def _multimodal_dataset(samples, split, args, augment=False):
         max_text_len=args.max_text_len,
         samples=samples,
         augment=augment,
+        ablate_modalities=getattr(args, "ablate_modalities", []),
     )
 
 

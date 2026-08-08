@@ -13,7 +13,10 @@ if "code" in sys.modules and not hasattr(sys.modules["code"], "__path__"):
 
 import torch
 
-from code.datasets.dataset import MultiModalBreastDataset
+from code.datasets.dataset import (
+    MultiModalBreastDataset,
+    VALID_ABLATION_MODALITIES,
+)
 from code.train.case_audit import (
     build_audit_summary,
     build_case_records,
@@ -54,6 +57,13 @@ def build_parser():
     parser.add_argument("--device", default="cuda:0", help="推理设备")
     parser.add_argument("--batch_size", type=_positive_integer, help="审计批次大小")
     parser.add_argument("--overwrite", action="store_true", help="允许覆盖非空审计目录")
+    parser.add_argument(
+        "--ablate_modalities",
+        nargs="*",
+        choices=VALID_ABLATION_MODALITIES,
+        default=[],
+        help="实验时屏蔽的模态列表",
+    )
     return parser
 
 
@@ -164,13 +174,18 @@ def run_case_audit(args):
         max_text_len=saved_args.max_text_len,
         samples=malignant_samples,
         augment=False,
+        ablate_modalities=getattr(args, "ablate_modalities", []),
     )
     loader_args = argparse.Namespace(**vars(saved_args))
     loader_args.batch_size = args.batch_size or saved_args.batch_size
     loader_args.num_workers = getattr(saved_args, "num_workers", 0)
     inputs = collect_flat5_audit_inputs(model, build_eval_loader(dataset, loader_args), device, dataset)
     records = build_case_records(*inputs)
-    summary = build_audit_summary(records, saved_metrics)
+    summary = build_audit_summary(
+        records,
+        saved_metrics,
+        ablate_modalities=getattr(args, "ablate_modalities", []),
+    )
     write_audit_outputs(output_dir, records, summary, overwrite=args.overwrite)
     print(f"病例审计完成：共 {len(records)} 例，输出目录：{output_dir}")
     return output_dir

@@ -996,6 +996,21 @@ def test_checkpoint_configuration_rejects_missing_split_metadata(tmp_path):
     _assert_chinese_value_error(error)
 
 
+def test_cli_accepts_ablation_modalities():
+    """训练入口必须接受零个或多个待屏蔽模态。"""
+    args = build_parser().parse_args([
+        "--pretrained_path",
+        "TinyUSFM.pth",
+        "--task_mode",
+        "flat5",
+        "--ablate_modalities",
+        "swe",
+        "text",
+    ])
+
+    assert args.ablate_modalities == ["swe", "text"]
+
+
 def test_overfit_64_requires_matching_successful_32_gate(tmp_path):
     """64 例门禁必须由同配置的 32 例成功记录解锁。"""
     args = build_parser().parse_args([
