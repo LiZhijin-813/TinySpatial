@@ -5,6 +5,8 @@ from math import isfinite
 from numbers import Real
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as functional
 
 
 def compute_class_weights(
@@ -37,6 +39,74 @@ def compute_class_weights(
         if count > 0:
             weights[class_index] = total / (num_classes * count)
     return weights
+
+
+def compute_class_priors(
+    samples,
+    label_key,
+    num_classes,
+    ignore_index=None,
+    device="cpu",
+):
+    """按训练样本频数计算严格为正的类别先验。"""
+    if not isinstance(num_classes, int) or num_classes <= 0:
+        raise ValueError("类别数必须为正整数")
+
+    counts = Counter()
+    for sample in samples:
+        label = int(sample[label_key])
+        if ignore_index is not None and label == ignore_index:
+            continue
+        if not 0 <= label < num_classes:
+            raise ValueError(
+                f"标签 {label_key}={label} 超出 [0, {num_classes}) 范围"
+            )
+        counts[label] += 1
+
+    total = sum(counts.values())
+    if total == 0:
+        raise ValueError("无法从空样本集合计算类别先验")
+    missing = [index for index in range(num_classes) if counts[index] == 0]
+    if missing:
+        raise ValueError(f"类别先验存在空类别：{missing}")
+
+    priors = torch.tensor(
+        [counts[index] / total for index in range(num_classes)],
+        dtype=torch.float32,
+        device=device,
+    )
+    return priors
+
+
+class LogitAdjustedCrossEntropy(nn.Module):
+    """在交叉熵前加入 tau 倍类别先验对数的分类损失。"""
+
+    def __init__(self, class_priors, tau=1.0, reduction="mean"):
+        super().__init__()
+        priors = torch.as_tensor(class_priors, dtype=torch.float32)
+        if priors.ndim != 1 or priors.numel() == 0:
+            raise ValueError("class_priors 必须是一维非空张量")
+        if not torch.isfinite(priors).all() or (priors <= 0).any():
+            raise ValueError("class_priors 必须包含有限的正数")
+        if not isinstance(tau, Real) or isinstance(tau, bool):
+            raise ValueError("tau 必须为非布尔数值")
+        if not isfinite(float(tau)) or tau < 0:
+            raise ValueError("tau 必须为非负有限数")
+        if reduction not in {"none", "mean", "sum"}:
+            raise ValueError("reduction 必须为 none、mean 或 sum")
+
+        self.register_buffer("log_priors", priors.log())
+        self.tau = float(tau)
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        """返回加入类别先验校正后的交叉熵。"""
+        adjusted_logits = logits + self.tau * self.log_priors
+        return functional.cross_entropy(
+            adjusted_logits,
+            targets,
+            reduction=self.reduction,
+        )
 
 
 def compute_stage2_losses(

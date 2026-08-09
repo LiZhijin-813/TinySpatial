@@ -43,7 +43,11 @@ from code.train.stage2_engine import (
     monitor_value,
     train_one_epoch,
 )
-from code.train.stage2_objectives import compute_class_weights
+from code.train.stage2_objectives import (
+    LogitAdjustedCrossEntropy,
+    compute_class_priors,
+    compute_class_weights,
+)
 from code.utils.seed import seed_everything
 
 
@@ -120,6 +124,18 @@ def build_parser():
         choices=["inverse", "none"],
         default="inverse",
         help="flat5 五分类交叉熵类别权重策略",
+    )
+    parser.add_argument(
+        "--flat5_loss",
+        choices=["cross_entropy", "logit_adjusted"],
+        default="cross_entropy",
+        help="flat5 分类损失类型",
+    )
+    parser.add_argument(
+        "--logit_adjustment_tau",
+        type=float,
+        default=1.0,
+        help="Logit 类别先验校正强度",
     )
     parser.add_argument(
         "--malignant_metadata",
@@ -283,6 +299,16 @@ def validate_reliable_configuration(args):
         raise ValueError(
             "flat5_class_weighting=none 仅允许 task_mode=flat5"
         )
+    flat5_loss = getattr(args, "flat5_loss", "cross_entropy")
+    tau = getattr(args, "logit_adjustment_tau", 1.0)
+    if not math.isfinite(float(tau)) or tau < 0:
+        raise ValueError("logit_adjustment_tau 必须为非负有限数")
+    if args.task_mode != "flat5" and flat5_loss != "cross_entropy":
+        raise ValueError("flat5_loss 仅允许 task_mode=flat5")
+    if flat5_loss == "logit_adjusted" and args.flat5_class_weighting != "none":
+        raise ValueError(
+            "logit_adjusted 必须搭配 flat5_class_weighting=none，避免重复校正"
+        )
 
 
 def build_criteria_for_mode(
@@ -291,6 +317,8 @@ def build_criteria_for_mode(
     device,
     label_smoothing=0.0,
     flat5_class_weighting="inverse",
+    flat5_loss="cross_entropy",
+    logit_adjustment_tau=1.0,
 ):
     """按任务标签空间构造彼此独立的交叉熵损失。"""
     if task_mode == "overfit":
@@ -309,6 +337,24 @@ def build_criteria_for_mode(
             )
         }
     if task_mode == "flat5":
+        if flat5_loss == "logit_adjusted":
+            if flat5_class_weighting != "none":
+                raise ValueError(
+                    "logit_adjusted 必须搭配 flat5_class_weighting=none，避免重复校正"
+                )
+            return {
+                "class": LogitAdjustedCrossEntropy(
+                    compute_class_priors(
+                        samples,
+                        "class_label",
+                        5,
+                        device=device,
+                    ),
+                    tau=logit_adjustment_tau,
+                )
+            }
+        if flat5_loss != "cross_entropy":
+            raise ValueError(f"未知 flat5_loss 类型：{flat5_loss}")
         if flat5_class_weighting == "inverse":
             weights = compute_class_weights(
                 samples,
@@ -900,6 +946,8 @@ def main(args):
         device,
         label_smoothing=args.label_smoothing,
         flat5_class_weighting=args.flat5_class_weighting,
+        flat5_loss=getattr(args, "flat5_loss", "cross_entropy"),
+        logit_adjustment_tau=getattr(args, "logit_adjustment_tau", 1.0),
     )
     if args.task_mode == "overfit":
         optimizer = torch.optim.AdamW(

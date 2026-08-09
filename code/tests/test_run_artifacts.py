@@ -277,6 +277,8 @@ def test_cli_defaults_to_reliable_flat4_configuration():
 def test_flat5_cli_defaults_to_inverse_class_weighting():
     args = build_parser().parse_args(["--pretrained_path", "TinyUSFM.pth"])
     assert args.flat5_class_weighting == "inverse"
+    assert args.flat5_loss == "cross_entropy"
+    assert args.logit_adjustment_tau == 1.0
     criteria = build_criteria_for_mode(
         "flat5", _criterion_samples(), torch.device("cpu")
     )
@@ -291,6 +293,40 @@ def test_flat5_unweighted_criterion_has_no_class_weights():
         flat5_class_weighting="none",
     )
     assert criteria["class"].weight is None
+
+
+def test_logit_adjusted_criterion_uses_training_priors_without_inverse_weights():
+    samples = _criterion_samples() + [
+        {"class_label": 2, "malignancy_label": 1, "subtype_label": 2},
+        {"class_label": 3, "malignancy_label": 1, "subtype_label": 3},
+    ]
+    criteria = build_criteria_for_mode(
+        "flat5",
+        samples,
+        torch.device("cpu"),
+        flat5_class_weighting="none",
+        flat5_loss="logit_adjusted",
+        logit_adjustment_tau=0.5,
+    )
+
+    assert criteria["class"].tau == 0.5
+    assert criteria["class"].log_priors.tolist() == pytest.approx(
+        torch.tensor([2 / 6, 1 / 6, 1 / 6, 1 / 6, 1 / 6]).log().tolist()
+    )
+
+
+def test_logit_adjusted_loss_rejects_inverse_class_weighting():
+    args = build_parser().parse_args([
+        "--pretrained_path", "TinyUSFM.pth",
+        "--task_mode", "flat5",
+        "--flat5_loss", "logit_adjusted",
+    ])
+
+    with pytest.raises(ValueError) as error:
+        validate_reliable_configuration(args)
+
+    assert "flat5_class_weighting=none" in str(error.value)
+    _assert_chinese_value_error(error)
 
 
 def test_non_flat5_rejects_flat5_unweighted_strategy():

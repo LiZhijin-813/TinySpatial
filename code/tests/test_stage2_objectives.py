@@ -1,11 +1,14 @@
 """验证 Stage 2 分类头、类别权重与损失语义的契约。"""
 
+import pytest
 import torch
 import torch.nn as nn
 
 from code.models.stage2.task_heads import Stage2TaskHeads
 from code.train.stage2_objectives import (
+    LogitAdjustedCrossEntropy,
     compute_class_weights,
+    compute_class_priors,
     compute_stage2_losses,
 )
 
@@ -98,3 +101,33 @@ def test_separate_class_weights_have_expected_shapes():
     assert subtype.shape == (4,)
     assert torch.isfinite(binary).all()
     assert torch.isfinite(subtype).all()
+
+
+def test_compute_class_priors_returns_normalized_training_frequencies():
+    """类别先验应按训练样本频数归一化，并覆盖所有目标类别。"""
+    samples = [
+        {"class_label": 0},
+        {"class_label": 0},
+        {"class_label": 1},
+        {"class_label": 2},
+    ]
+
+    priors = compute_class_priors(samples, "class_label", 3)
+
+    assert priors.tolist() == pytest.approx([0.5, 0.25, 0.25])
+
+
+def test_logit_adjusted_cross_entropy_adds_log_prior_to_logits():
+    """Logit 校正交叉熵应将 tau 倍类别先验对数加到 logits 上。"""
+    logits = torch.zeros(2, 3, requires_grad=True)
+    targets = torch.tensor([0, 2])
+    priors = torch.tensor([0.5, 0.25, 0.25])
+    criterion = LogitAdjustedCrossEntropy(priors, tau=0.5)
+
+    loss = criterion(logits, targets)
+    expected_logits = logits.detach() + 0.5 * priors.log()
+    expected = torch.nn.functional.cross_entropy(expected_logits, targets)
+
+    assert torch.allclose(loss, expected)
+    loss.backward()
+    assert logits.grad is not None
