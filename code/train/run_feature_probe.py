@@ -187,7 +187,13 @@ def run_probe(run_dir, output_dir, device_name="cuda:0", batch_size=None):
         "geometry": _geometry_summary(train_features, train_labels),
         "nearest_centroid": {},
         "linear_probe": {},
+        "linear_probe_inverse": {},
     }
+    train_counts = torch.tensor(
+        [int((train_labels == class_index).sum()) for class_index in range(4)],
+        dtype=torch.float32,
+    )
+    inverse_weights = train_counts.sum() / (4.0 * train_counts)
     for name in ("val", "test"):
         query_features, query_labels, _ = extracted[name]
         centroid_predictions = nearest_centroid_predict(
@@ -205,6 +211,16 @@ def run_probe(run_dir, output_dir, device_name="cuda:0", batch_size=None):
             learning_rate=0.05,
             weight_decay=1e-4,
         )
+        inverse_predictions = fit_linear_probe(
+            train_features,
+            train_labels,
+            query_features,
+            num_classes=4,
+            epochs=300,
+            learning_rate=0.05,
+            weight_decay=1e-4,
+            class_weights=inverse_weights,
+        )
         metrics["nearest_centroid"][name] = _metric_summary(
             query_labels,
             centroid_predictions,
@@ -212,6 +228,10 @@ def run_probe(run_dir, output_dir, device_name="cuda:0", batch_size=None):
         metrics["linear_probe"][name] = _metric_summary(
             query_labels,
             linear_predictions,
+        )
+        metrics["linear_probe_inverse"][name] = _metric_summary(
+            query_labels,
+            inverse_predictions,
         )
 
     output_path = Path(output_dir)

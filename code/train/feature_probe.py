@@ -88,6 +88,7 @@ def fit_linear_probe(
     epochs=200,
     learning_rate=0.1,
     weight_decay=0.0,
+    class_weights=None,
 ):
     """仅使用训练特征拟合线性探针，并返回查询特征的预测类别。"""
     _validate_num_classes(num_classes)
@@ -107,6 +108,14 @@ def fit_linear_probe(
         raise ValueError("学习率必须是正的有限数")
     if not isfinite(float(weight_decay)) or weight_decay < 0:
         raise ValueError("权重衰减必须是非负有限数")
+    if class_weights is not None:
+        if not isinstance(class_weights, torch.Tensor):
+            raise ValueError("类别权重必须是一维张量")
+        if class_weights.ndim != 1 or class_weights.shape[0] != num_classes:
+            raise ValueError("类别权重维度必须与类别数一致")
+        if not torch.isfinite(class_weights).all() or (class_weights <= 0).any():
+            raise ValueError("类别权重必须是有限的正数")
+        class_weights = class_weights.float()
 
     probe = nn.Linear(train_features.shape[1], num_classes)
     nn.init.zeros_(probe.weight)
@@ -118,7 +127,11 @@ def fit_linear_probe(
     )
     for _ in range(epochs):
         optimizer.zero_grad(set_to_none=True)
-        loss = nn.functional.cross_entropy(probe(train_features), train_labels)
+        loss = nn.functional.cross_entropy(
+            probe(train_features),
+            train_labels,
+            weight=class_weights,
+        )
         loss.backward()
         optimizer.step()
 

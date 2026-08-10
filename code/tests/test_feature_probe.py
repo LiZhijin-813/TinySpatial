@@ -54,3 +54,23 @@ def test_fit_linear_probe_can_separate_linearly_separable_features():
     )
 
     assert predictions.tolist() == [0, 1]
+
+
+def test_fit_linear_probe_accepts_positive_class_weights():
+    """线性探针应支持仅作用于训练损失的类别权重。"""
+    train_features = torch.tensor(
+        [[-2.0, -1.0], [-1.5, -0.5], [1.5, 0.5], [2.0, 1.0]]
+    )
+    train_labels = torch.tensor([0, 0, 1, 1])
+
+    predictions = fit_linear_probe(
+        train_features,
+        train_labels,
+        train_features,
+        num_classes=2,
+        epochs=20,
+        learning_rate=0.1,
+        class_weights=torch.tensor([1.0, 2.0]),
+    )
+
+    assert predictions.shape == train_labels.shape
