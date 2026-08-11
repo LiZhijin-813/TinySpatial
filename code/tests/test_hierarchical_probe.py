@@ -15,6 +15,12 @@ from code.train.run_cv_hierarchical_probe import (
 )
 
 
+class _空模型:
+    def load_state_dict(self, state_dict, strict=True):
+        assert state_dict == {}
+        assert strict is True
+
+
 def _write_json(path, payload):
     path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
@@ -55,7 +61,7 @@ def _five_single_case_folds(prefix="病例"):
     return [
         {
             "fold": index,
-            "case_ids": [f"{prefix}-{index}"],
+            "case_ids": [f"{prefix}{index}"],
         }
         for index in range(5)
     ]
@@ -70,13 +76,41 @@ def _manifest_with(folds=None, n_splits=5):
     }
 
 
+def _二十例四分类样本():
+    samples = []
+    for fold_id in range(5):
+        for label in range(4):
+            case_id = f"病例{fold_id}-{label}"
+            samples.append(
+                {
+                    "case_id": case_id,
+                    "subtype_label": label,
+                    "split": "train",
+                    "source": "malignant",
+                    "class_label": label,
+                    "malignancy_label": 1,
+                }
+            )
+    return samples
+
+
+def _二十例四分类折清单():
+    return [
+        {
+            "fold": fold_id,
+            "case_ids": [f"病例{fold_id}-{label}" for label in range(4)],
+        }
+        for fold_id in range(5)
+    ]
+
+
 def test_validate_manifest_structure_preserves_explicit_fold_ids():
     folds = [
-        {"fold": 4, "case_ids": ["case-4"]},
-        {"fold": 2, "case_ids": ["case-2"]},
-        {"fold": 0, "case_ids": ["case-0"]},
-        {"fold": 3, "case_ids": ["case-3"]},
-        {"fold": 1, "case_ids": ["case-1"]},
+        {"fold": 4, "case_ids": ["case4"]},
+        {"fold": 2, "case_ids": ["case2"]},
+        {"fold": 0, "case_ids": ["case0"]},
+        {"fold": 3, "case_ids": ["case3"]},
+        {"fold": 1, "case_ids": ["case1"]},
     ]
 
     normalized = hierarchical_probe_module._validate_manifest_structure(
@@ -85,6 +119,20 @@ def test_validate_manifest_structure_preserves_explicit_fold_ids():
 
     assert [fold["fold"] for fold in normalized] == [4, 2, 0, 3, 1]
     assert sorted(fold["fold"] for fold in normalized) == [0, 1, 2, 3, 4]
+
+
+def test_validate_manifest_structure_rejects_suspected_group_across_folds():
+    folds = _five_single_case_folds(prefix="case")
+    folds[0]["case_ids"] = ["1247-L"]
+    folds[1]["case_ids"] = ["1247-R"]
+
+    with pytest.raises(ValueError, match="疑似病例组.*1247.*只能属于一个 fold") as exc_info:
+        hierarchical_probe_module._validate_manifest_structure(_manifest_with(folds))
+
+    message = str(exc_info.value)
+    assert "1247-L" in message
+    assert "1247-R" in message
+    assert message.isascii() is False
 
 
 @pytest.mark.parametrize(
@@ -205,7 +253,7 @@ def test_normalize_manifest_folds_requires_explicit_fold_field():
         {"case_ids": ["case-0"]},
         *_five_single_case_folds()[1:],
     ]
-    case_label_map = {f"case-{index}": index % 4 for index in range(5)}
+    case_label_map = {f"case{index}": index % 4 for index in range(5)}
 
     with pytest.raises(ValueError, match="每个折必须显式包含 fold 字段") as exc_info:
         hierarchical_probe_module._normalize_manifest_folds(
@@ -224,12 +272,12 @@ def test_normalize_manifest_folds_requires_explicit_fold_field():
                 *_five_single_case_folds()[:4],
                 {"fold": 4, "case_ids": ["unknown-case"]},
             ],
-            {f"case-{index}": index % 4 for index in range(5)},
+            {f"病例{index}": index % 4 for index in range(5)},
             "未知病例编号",
         ),
         (
             _five_single_case_folds(prefix="case"),
-            {f"case-{index}": index % 4 for index in range(6)},
+            {f"case{index}": index % 4 for index in range(6)},
             "未覆盖全部恶性病例",
         ),
     ],
@@ -244,6 +292,30 @@ def test_normalize_manifest_folds_reports_chinese_cross_case_errors(
         )
 
     assert str(exc_info.value).isascii() is False
+
+
+def test_normalize_manifest_folds_rejects_suspected_group_across_folds():
+    folds = _five_single_case_folds(prefix="case")
+    folds[0]["case_ids"] = ["1247-L"]
+    folds[1]["case_ids"] = ["1247-R"]
+    case_label_map = {
+        "1247-L": 0,
+        "1247-R": 1,
+        "case2": 2,
+        "case3": 3,
+        "case4": 0,
+    }
+
+    with pytest.raises(ValueError, match="疑似病例组.*1247.*只能属于一个 fold") as exc_info:
+        hierarchical_probe_module._normalize_manifest_folds(
+            _manifest_with(folds),
+            case_label_map,
+        )
+
+    message = str(exc_info.value)
+    assert "1247-L" in message
+    assert "1247-R" in message
+    assert message.isascii() is False
 
 
 def test_build_hierarchical_tasks_returns_three_expected_tasks():
@@ -608,6 +680,38 @@ def test_run_cv_hierarchical_probe_rejects_invalid_fold_ids_before_metadata_or_w
         )
 
 
+def test_run_cv_hierarchical_probe_rejects_suspected_group_before_metadata_or_weights(
+    tmp_path, monkeypatch
+):
+    run_dir = _make_run_dir(tmp_path)
+    folds = _five_single_case_folds(prefix="case")
+    folds[0]["case_ids"] = ["1247-L"]
+    folds[1]["case_ids"] = ["1247-R"]
+    manifest_path = _make_manifest(tmp_path, folds)
+    output_dir = tmp_path / "输出"
+    output_dir.mkdir()
+
+    monkeypatch.setattr(
+        hierarchical_probe_module,
+        "load_metadata",
+        lambda *args, **kwargs: pytest.fail("疑似病例组跨折不应加载元数据"),
+    )
+    monkeypatch.setattr(
+        hierarchical_probe_module.torch,
+        "load",
+        lambda *args, **kwargs: pytest.fail("疑似病例组跨折不应加载权重"),
+    )
+
+    with pytest.raises(ValueError, match="疑似病例组.*1247.*只能属于一个 fold"):
+        run_cv_hierarchical_probe(
+            run_dir,
+            manifest_path,
+            output_dir,
+            device_name="cpu",
+            batch_size=2,
+        )
+
+
 def test_run_cv_hierarchical_probe_rejects_empty_hierarchical_selection_without_loading_weights(
     tmp_path, monkeypatch
 ):
@@ -627,7 +731,7 @@ def test_run_cv_hierarchical_probe_rejects_empty_hierarchical_selection_without_
         "load_metadata",
         lambda *args, **kwargs: [
             {
-                "case_id": f"病例-{index}",
+                "case_id": f"病例{index}",
                 "subtype_label": index % 2,
                 "split": "train",
                 "source": "malignant",
@@ -651,3 +755,105 @@ def test_run_cv_hierarchical_probe_rejects_empty_hierarchical_selection_without_
             device_name="cpu",
             batch_size=2,
         )
+
+
+def test_run_cv_hierarchical_probe_cpu_mock_success_writes_task_protocol(
+    tmp_path, monkeypatch
+):
+    run_dir = _make_run_dir(tmp_path)
+    manifest_path = _make_manifest(tmp_path, _二十例四分类折清单())
+    output_dir = tmp_path / "输出"
+    samples = _二十例四分类样本()
+    labels = torch.tensor([sample["subtype_label"] for sample in samples], dtype=torch.long)
+    features = torch.arange(len(samples) * 3, dtype=torch.float32).reshape(len(samples), 3)
+    case_ids = [sample["case_id"] for sample in samples]
+
+    monkeypatch.setattr(
+        hierarchical_probe_module,
+        "load_metadata",
+        lambda *args, **kwargs: samples,
+    )
+    monkeypatch.setattr(
+        hierarchical_probe_module,
+        "MultiModalBreastDataset",
+        lambda *args, **kwargs: {"samples": kwargs["samples"]},
+    )
+    monkeypatch.setattr(
+        hierarchical_probe_module,
+        "build_eval_loader",
+        lambda dataset, loader_args: ("loader", dataset, loader_args.batch_size),
+    )
+    monkeypatch.setattr(
+        hierarchical_probe_module,
+        "build_model",
+        lambda model_args, device: _空模型(),
+    )
+    monkeypatch.setattr(
+        hierarchical_probe_module.torch,
+        "load",
+        lambda *args, **kwargs: {"model_state_dict": {}},
+    )
+    monkeypatch.setattr(
+        hierarchical_probe_module,
+        "_collect_features",
+        lambda model, loader, device: (features, labels, case_ids),
+    )
+    monkeypatch.setattr(
+        hierarchical_probe_module,
+        "fit_linear_probe",
+        lambda train_features, train_labels, query_features, **kwargs: torch.arange(
+            query_features.shape[0],
+            dtype=torch.long,
+        )
+        % 2,
+    )
+
+    results = run_cv_hierarchical_probe(
+        run_dir,
+        manifest_path,
+        output_dir,
+        device_name="cpu",
+        batch_size=4,
+    )
+
+    output_file = output_dir / "hierarchical_probe_metrics.json"
+    assert output_file.is_file()
+    saved_results = json.loads(output_file.read_text(encoding="utf-8"))
+    assert saved_results == results
+    assert saved_results["sample_count"] == 20
+    assert saved_results["feature_dimension"] == 3
+    assert "仅使用训练折拟合二分类线性探针" in saved_results["protocol"]
+
+    luminal_task = saved_results["tasks"]["luminal_vs_non_luminal"]
+    assert luminal_task["effective_count"] == 20
+    assert luminal_task["label_distribution"] == [10, 10]
+    assert luminal_task["fold_query_effective_counts"] == [
+        {"fold": 0, "query_effective_count": 4},
+        {"fold": 1, "query_effective_count": 4},
+        {"fold": 2, "query_effective_count": 4},
+        {"fold": 3, "query_effective_count": 4},
+        {"fold": 4, "query_effective_count": 4},
+    ]
+
+    luminal_a_task = saved_results["tasks"]["luminal_a_vs_luminal_b"]
+    assert luminal_a_task["effective_count"] == 10
+    assert luminal_a_task["label_distribution"] == [5, 5]
+    assert luminal_a_task["fold_query_effective_counts"] == [
+        {"fold": fold_id, "query_effective_count": 2}
+        for fold_id in range(5)
+    ]
+
+    for task_result in saved_results["tasks"].values():
+        assert [record["fold"] for record in task_result["methods"]["plain"]] == [
+            0,
+            1,
+            2,
+            3,
+            4,
+        ]
+        assert set(task_result["summary"]) == {"plain", "inverse_frequency"}
+        assert "macro_f1" in task_result["summary"]["plain"]
+        first_record = task_result["methods"]["plain"][0]
+        assert first_record["confusion_matrix"]
+        assert first_record["train_effective_count"] > 0
+        assert first_record["query_effective_count"] > 0

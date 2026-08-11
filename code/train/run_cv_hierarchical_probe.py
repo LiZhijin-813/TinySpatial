@@ -17,7 +17,7 @@ if "code" in sys.modules and not hasattr(sys.modules["code"], "__path__"):
     del sys.modules["code"]
 
 from code.datasets.dataset import MultiModalBreastDataset
-from code.datasets.split_utils import load_metadata
+from code.datasets.split_utils import derive_suspected_group_id, load_metadata
 from code.train.feature_probe import fit_linear_probe
 from code.train.run_cv_feature_probe import (
     _collect_features,
@@ -212,7 +212,31 @@ def _validate_manifest_structure(manifest):
     fold_ids = [fold["fold"] for fold in normalized]
     if sorted(fold_ids) != [0, 1, 2, 3, 4]:
         raise ValueError("cv_manifest 的 fold 字段必须唯一且集合正好为 0..4")
+    _validate_suspected_groups_single_fold(normalized)
     return normalized
+
+
+def _validate_suspected_groups_single_fold(folds):
+    """校验同一疑似病例组不会跨验证折出现。"""
+    group_index = {}
+    for fold in folds:
+        fold_id = fold["fold"]
+        for case_id in fold["case_ids"]:
+            suspected_group_id = derive_suspected_group_id(case_id)
+            previous = group_index.get(suspected_group_id)
+            if previous is not None and previous["fold"] != fold_id:
+                raise ValueError(
+                    f"疑似病例组 {suspected_group_id} 只能属于一个 fold："
+                    f"第 {previous['fold']} 折包含 {previous['case_ids']}，"
+                    f"第 {fold_id} 折包含 {[case_id]}"
+                )
+            if previous is None:
+                group_index[suspected_group_id] = {
+                    "fold": fold_id,
+                    "case_ids": [case_id],
+                }
+            else:
+                previous["case_ids"].append(case_id)
 
 
 def _normalize_manifest_folds(manifest, case_label_map):
@@ -266,6 +290,8 @@ def _normalize_manifest_folds(manifest, case_label_map):
         for case_id in fold_case_ids:
             seen_case_ids[case_id] = fold_id
         normalized.append({"fold": fold_id, "case_ids": list(fold_case_ids)})
+
+    _validate_suspected_groups_single_fold(normalized)
 
     missing_case_ids = [
         case_id for case_id in case_label_map if case_id not in seen_case_ids
@@ -324,6 +350,15 @@ def _build_binary_metrics(labels, predictions, task):
 def _binary_distribution(labels):
     """统计二分类标签分布。"""
     return torch.bincount(labels, minlength=2).tolist()
+
+
+def _build_task_distribution(labels, task):
+    """统计任务在全部恶性病例上的有效样本数与二分类标签分布。"""
+    _, binary_labels = select_hierarchical_labels(labels, task)
+    return {
+        "effective_count": int(binary_labels.numel()),
+        "label_distribution": _binary_distribution(binary_labels),
+    }
 
 
 def _build_fold_record(fold_id, train_binary, query_binary, metrics):
@@ -429,8 +464,12 @@ def run_cv_hierarchical_probe(
 
     ordered_positions = list(range(len(case_ids)))
     for task_key, task in tasks.items():
+        task_distribution = _build_task_distribution(labels, task)
         task_result = {
             "display_names": list(task["display_names"]),
+            "effective_count": task_distribution["effective_count"],
+            "label_distribution": task_distribution["label_distribution"],
+            "fold_query_effective_counts": [],
             "methods": {
                 "plain": [],
                 "inverse_frequency": [],
@@ -459,6 +498,12 @@ def run_cv_hierarchical_probe(
                     f"{task_name}在第 {fold_id} 折的层级筛选结果为空"
                 )
             validate_fold_labels(train_binary, query_binary, task_name)
+            task_result["fold_query_effective_counts"].append(
+                {
+                    "fold": int(fold_id),
+                    "query_effective_count": int(query_binary.numel()),
+                }
+            )
 
             selected_train_features = train_features[train_mask]
             selected_query_features = query_features[query_mask]

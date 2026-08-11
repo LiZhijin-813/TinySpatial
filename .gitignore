@@ -3,6 +3,7 @@ checkpoints/
 
 # 本地实验运行产物
 runs/
+.hf_cache/
 
 # Python cache
 __pycache__/
