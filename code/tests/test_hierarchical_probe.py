@@ -164,3 +164,11 @@ def test_validate_fold_labels_rejects_query_labels_without_both_classes():
             torch.tensor([1, 1], dtype=torch.int64),
             "示例任务",
         )
+
+def test_validate_fold_labels_rejects_empty_training_labels():
+    with pytest.raises(ValueError, match="缺少二分类类别"):
+        validate_fold_labels(
+            torch.empty(0, dtype=torch.long),
+            torch.tensor([0, 1]),
+            "示例任务",
+        )
