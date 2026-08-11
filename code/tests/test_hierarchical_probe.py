@@ -2,8 +2,10 @@ import pytest
 import torch
 
 from code.train.run_cv_hierarchical_probe import (
+    aggregate_binary_metrics,
     build_hierarchical_tasks,
     select_hierarchical_labels,
+    validate_fold_labels,
 )
 
 
@@ -66,3 +68,67 @@ def test_select_hierarchical_labels_rejects_invalid_input(
 
     with pytest.raises(ValueError, match=error_fragment):
         select_hierarchical_labels(labels, tasks["luminal_vs_non_luminal"])
+
+
+def test_aggregate_binary_metrics_returns_mean_std_and_values():
+    aggregated = aggregate_binary_metrics(
+        [
+            {
+                "macro_f1": 0.25,
+                "balanced_accuracy": 0.5,
+            },
+            {
+                "macro_f1": 0.75,
+                "balanced_accuracy": 1.0,
+            },
+        ]
+    )
+
+    assert aggregated == {
+        "macro_f1": {
+            "mean": 0.5,
+            "std": 0.25,
+            "values": [0.25, 0.75],
+        },
+        "balanced_accuracy": {
+            "mean": 0.75,
+            "std": 0.25,
+            "values": [0.5, 1.0],
+        },
+    }
+    assert all(
+        isinstance(value, float)
+        for metric in aggregated.values()
+        for value in [metric["mean"], metric["std"], *metric["values"]]
+    )
+
+
+def test_aggregate_binary_metrics_rejects_empty_metrics():
+    with pytest.raises(ValueError, match="不能为空"):
+        aggregate_binary_metrics([])
+
+
+def test_validate_fold_labels_accepts_binary_integer_labels():
+    validate_fold_labels(
+        torch.tensor([0, 1, 0, 1], dtype=torch.int64),
+        torch.tensor([1, 0], dtype=torch.int32),
+        "示例任务",
+    )
+
+
+def test_validate_fold_labels_rejects_train_labels_without_both_classes():
+    with pytest.raises(ValueError, match="示例任务"):
+        validate_fold_labels(
+            torch.tensor([0, 0, 0], dtype=torch.int64),
+            torch.tensor([0, 1], dtype=torch.int64),
+            "示例任务",
+        )
+
+
+def test_validate_fold_labels_rejects_query_labels_without_both_classes():
+    with pytest.raises(ValueError, match="示例任务"):
+        validate_fold_labels(
+            torch.tensor([0, 1, 0], dtype=torch.int64),
+            torch.tensor([1, 1], dtype=torch.int64),
+            "示例任务",
+        )

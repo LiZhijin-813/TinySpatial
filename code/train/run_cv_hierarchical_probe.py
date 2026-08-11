@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 
@@ -54,3 +56,46 @@ def select_hierarchical_labels(labels, task):
     mask = positive | negative
     binary_labels = torch.where(positive[mask], 0, 1)
     return mask, binary_labels
+
+
+def aggregate_binary_metrics(fold_metrics):
+    """汇总二分类任务在各折上的指标均值、标准差与逐折数值。"""
+    if not fold_metrics:
+        raise ValueError("折级指标不能为空")
+
+    aggregated = {}
+    for metric_name in ("macro_f1", "balanced_accuracy"):
+        values = [float(metrics[metric_name]) for metrics in fold_metrics]
+        mean_value = sum(values) / len(values)
+        variance = sum(
+            (value - mean_value) ** 2 for value in values
+        ) / len(values)
+        aggregated[metric_name] = {
+            "mean": float(mean_value),
+            "std": float(math.sqrt(variance)),
+            "values": [float(value) for value in values],
+        }
+    return aggregated
+
+
+def validate_fold_labels(train_labels, query_labels, task_name):
+    """校验训练折与测试折标签是否满足二分类探针要求。"""
+
+    def _validate_tensor(labels, split_name):
+        if not isinstance(labels, torch.Tensor) or labels.ndim != 1:
+            raise ValueError(f"{task_name}的{split_name}标签必须是一维整数张量")
+        if labels.dtype not in (
+            torch.int8,
+            torch.uint8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+        ):
+            raise ValueError(f"{task_name}的{split_name}标签必须是一维整数张量")
+
+        unique_labels = set(labels.tolist())
+        if not {0, 1}.issubset(unique_labels):
+            raise ValueError(f"{task_name}的{split_name}标签必须同时包含 0 和 1")
+
+    _validate_tensor(train_labels, "训练折")
+    _validate_tensor(query_labels, "测试折")
