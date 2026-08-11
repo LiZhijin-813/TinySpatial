@@ -1,12 +1,63 @@
+import json
+
 import pytest
 import torch
+
+import code.train.run_cv_hierarchical_probe as hierarchical_probe_module
 
 from code.train.run_cv_hierarchical_probe import (
     aggregate_binary_metrics,
     build_hierarchical_tasks,
+    run_cv_hierarchical_probe,
     select_hierarchical_labels,
     validate_fold_labels,
 )
+
+
+def _write_json(path, payload):
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _make_run_dir(tmp_path, task_mode="flat5"):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_json(
+        run_dir / "args.json",
+        {
+            "task_mode": task_mode,
+            "malignant_metadata": "metadata.csv",
+            "img_size": 224,
+            "max_text_len": 32,
+            "ablate_modalities": [],
+            "num_workers": 0,
+        },
+    )
+    (run_dir / "best_model.pth").write_bytes(b"stub")
+    return run_dir
+
+
+def _make_manifest(tmp_path, folds):
+    return _write_json(
+        tmp_path / "cv_manifest.json",
+        {
+            "n_splits": 5,
+            "folds": folds,
+        },
+    )
+
+
+def _five_single_case_folds(prefix="病例"):
+    return [
+        {
+            "fold": index,
+            "case_ids": [f"{prefix}-{index}"],
+        }
+        for index in range(5)
+    ]
 
 
 def test_build_hierarchical_tasks_returns_three_expected_tasks():
@@ -180,4 +231,97 @@ def test_validate_fold_labels_rejects_empty_query_labels():
             torch.tensor([0, 1]),
             torch.empty(0, dtype=torch.long),
             "示例任务",
+        )
+
+
+def test_run_cv_hierarchical_probe_rejects_non_five_fold_manifest_without_loading_weights(
+    tmp_path, monkeypatch
+):
+    run_dir = _make_run_dir(tmp_path)
+    manifest_path = _make_manifest(tmp_path, _five_single_case_folds()[:4])
+    output_dir = tmp_path / "输出"
+    output_dir.mkdir()
+
+    monkeypatch.setattr(
+        hierarchical_probe_module.torch,
+        "load",
+        lambda *args, **kwargs: pytest.fail("边界测试不应加载检查点权重"),
+    )
+
+    with pytest.raises(ValueError, match="五个验证折"):
+        run_cv_hierarchical_probe(
+            run_dir,
+            manifest_path,
+            output_dir,
+            device_name="cpu",
+            batch_size=2,
+        )
+
+
+def test_run_cv_hierarchical_probe_rejects_flat4_checkpoint_without_loading_weights(
+    tmp_path, monkeypatch
+):
+    run_dir = _make_run_dir(tmp_path, task_mode="flat4")
+    manifest_path = _make_manifest(tmp_path, _five_single_case_folds())
+    output_dir = tmp_path / "输出"
+    output_dir.mkdir()
+
+    monkeypatch.setattr(
+        hierarchical_probe_module.torch,
+        "load",
+        lambda *args, **kwargs: pytest.fail("边界测试不应加载检查点权重"),
+    )
+
+    with pytest.raises(ValueError, match="flat5"):
+        run_cv_hierarchical_probe(
+            run_dir,
+            manifest_path,
+            output_dir,
+            device_name="cpu",
+            batch_size=2,
+        )
+
+
+def test_run_cv_hierarchical_probe_rejects_empty_hierarchical_selection_without_loading_weights(
+    tmp_path, monkeypatch
+):
+    run_dir = _make_run_dir(tmp_path)
+    manifest_path = _make_manifest(tmp_path, _five_single_case_folds())
+    output_dir = tmp_path / "输出"
+    output_dir.mkdir()
+    tasks = build_hierarchical_tasks()
+
+    monkeypatch.setattr(
+        hierarchical_probe_module,
+        "build_hierarchical_tasks",
+        lambda: {"her2_vs_tnbc": tasks["her2_vs_tnbc"]},
+    )
+    monkeypatch.setattr(
+        hierarchical_probe_module,
+        "load_metadata",
+        lambda *args, **kwargs: [
+            {
+                "case_id": f"病例-{index}",
+                "subtype_label": index % 2,
+                "split": "train",
+                "source": "malignant",
+                "class_label": index % 2,
+                "malignancy_label": 1,
+            }
+            for index in range(5)
+        ],
+    )
+    monkeypatch.setattr(
+        hierarchical_probe_module.torch,
+        "load",
+        lambda *args, **kwargs: pytest.fail("边界测试不应加载检查点权重"),
+    )
+
+    with pytest.raises(ValueError, match="层级筛选结果为空"):
+        run_cv_hierarchical_probe(
+            run_dir,
+            manifest_path,
+            output_dir,
+            device_name="cpu",
+            batch_size=2,
         )
