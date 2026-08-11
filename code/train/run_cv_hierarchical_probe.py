@@ -95,7 +95,7 @@ def validate_fold_labels(train_labels, query_labels, task_name):
 
         unique_labels = set(labels.tolist())
         if not {0, 1}.issubset(unique_labels):
-            raise ValueError(f"{task_name}的{split_name}标签必须同时包含 0 和 1")
+            raise ValueError(f"{task_name}的{split_name}标签缺少二分类类别 0 或 1")
 
     _validate_tensor(train_labels, "训练折")
     _validate_tensor(query_labels, "测试折")

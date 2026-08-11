@@ -116,8 +116,40 @@ def test_validate_fold_labels_accepts_binary_integer_labels():
     )
 
 
+@pytest.mark.parametrize(
+    "train_labels, query_labels, error_fragment",
+    [
+        (
+            torch.tensor([[0, 1]], dtype=torch.int64),
+            torch.tensor([0, 1], dtype=torch.int64),
+            "一维整数张量",
+        ),
+        (
+            torch.tensor([0.0, 1.0], dtype=torch.float32),
+            torch.tensor([0, 1], dtype=torch.int64),
+            "一维整数张量",
+        ),
+        (
+            torch.tensor([0, 1], dtype=torch.int64),
+            torch.tensor([[0, 1]], dtype=torch.int64),
+            "一维整数张量",
+        ),
+        (
+            torch.tensor([0, 1], dtype=torch.int64),
+            torch.tensor([0.0, 1.0], dtype=torch.float32),
+            "一维整数张量",
+        ),
+    ],
+)
+def test_validate_fold_labels_rejects_non_vector_or_non_integer_tensors(
+    train_labels, query_labels, error_fragment
+):
+    with pytest.raises(ValueError, match=error_fragment):
+        validate_fold_labels(train_labels, query_labels, "示例任务")
+
+
 def test_validate_fold_labels_rejects_train_labels_without_both_classes():
-    with pytest.raises(ValueError, match="示例任务"):
+    with pytest.raises(ValueError, match="缺少二分类类别"):
         validate_fold_labels(
             torch.tensor([0, 0, 0], dtype=torch.int64),
             torch.tensor([0, 1], dtype=torch.int64),
@@ -126,7 +158,7 @@ def test_validate_fold_labels_rejects_train_labels_without_both_classes():
 
 
 def test_validate_fold_labels_rejects_query_labels_without_both_classes():
-    with pytest.raises(ValueError, match="示例任务"):
+    with pytest.raises(ValueError, match="缺少二分类类别"):
         validate_fold_labels(
             torch.tensor([0, 1, 0], dtype=torch.int64),
             torch.tensor([1, 1], dtype=torch.int64),
