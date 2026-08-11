@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -58,6 +59,191 @@ def _five_single_case_folds(prefix="病例"):
         }
         for index in range(5)
     ]
+
+
+def _manifest_with(folds=None, n_splits=5):
+    if folds is None:
+        folds = _five_single_case_folds()
+    return {
+        "n_splits": n_splits,
+        "folds": folds,
+    }
+
+
+def test_validate_manifest_structure_preserves_explicit_fold_ids():
+    folds = [
+        {"fold": 4, "case_ids": ["case-4"]},
+        {"fold": 2, "case_ids": ["case-2"]},
+        {"fold": 0, "case_ids": ["case-0"]},
+        {"fold": 3, "case_ids": ["case-3"]},
+        {"fold": 1, "case_ids": ["case-1"]},
+    ]
+
+    normalized = hierarchical_probe_module._validate_manifest_structure(
+        _manifest_with(folds)
+    )
+
+    assert [fold["fold"] for fold in normalized] == [4, 2, 0, 3, 1]
+    assert sorted(fold["fold"] for fold in normalized) == [0, 1, 2, 3, 4]
+
+
+@pytest.mark.parametrize(
+    "manifest, error_fragment",
+    [
+        (_manifest_with(n_splits=4), "n_splits 必须等于 5"),
+        ({"n_splits": 5, "folds": "bad"}, "folds 必须是包含五个验证折的列表"),
+        (
+            {"n_splits": 5, "folds": _five_single_case_folds()[:4]},
+            "folds 必须是包含五个验证折的列表",
+        ),
+        (
+            _manifest_with(
+                folds=[
+                    *_five_single_case_folds()[:2],
+                    "bad",
+                    *_five_single_case_folds()[3:],
+                ]
+            ),
+            "每个折必须是对象",
+        ),
+        (
+            _manifest_with(
+                folds=[
+                    {"case_ids": ["case-0"]},
+                    *_five_single_case_folds()[1:],
+                ]
+            ),
+            "每个折必须显式包含 fold 字段",
+        ),
+        (
+            _manifest_with(
+                folds=[
+                    {"fold": True, "case_ids": ["case-0"]},
+                    *_five_single_case_folds()[1:],
+                ]
+            ),
+            "fold 字段必须是整数",
+        ),
+        (
+            _manifest_with(
+                folds=[
+                    {"fold": 0, "case_ids": "case-0"},
+                    *_five_single_case_folds()[1:],
+                ]
+            ),
+            "case_ids 必须是非空列表",
+        ),
+        (
+            _manifest_with(
+                folds=[
+                    {"fold": 0, "case_ids": []},
+                    *_five_single_case_folds()[1:],
+                ]
+            ),
+            "case_ids 必须是非空列表",
+        ),
+        (
+            _manifest_with(
+                folds=[
+                    {"fold": 0, "case_ids": ["case-0", " "]},
+                    *_five_single_case_folds()[1:],
+                ]
+            ),
+            "case_ids 包含无效病例编号",
+        ),
+        (
+            _manifest_with(
+                folds=[
+                    {"fold": 0, "case_ids": ["case-0", "case-0"]},
+                    *_five_single_case_folds()[1:],
+                ]
+            ),
+            "case_ids 包含重复病例编号",
+        ),
+        (
+            _manifest_with(
+                folds=[
+                    {"fold": 0, "case_ids": ["case-0"]},
+                    {"fold": 1, "case_ids": ["case-1"]},
+                    {"fold": 1, "case_ids": ["case-2"]},
+                    {"fold": 3, "case_ids": ["case-3"]},
+                    {"fold": 4, "case_ids": ["case-4"]},
+                ]
+            ),
+            "fold 字段必须唯一且集合正好为 0..4",
+        ),
+        (
+            _manifest_with(
+                folds=[
+                    *_five_single_case_folds()[:4],
+                    {"fold": 5, "case_ids": ["case-4"]},
+                ]
+            ),
+            "fold 字段必须唯一且集合正好为 0..4",
+        ),
+    ],
+)
+def test_validate_manifest_structure_reports_chinese_errors(
+    manifest, error_fragment
+):
+    with pytest.raises(ValueError, match=error_fragment) as exc_info:
+        hierarchical_probe_module._validate_manifest_structure(manifest)
+
+    assert str(exc_info.value).isascii() is False
+
+
+def test_hierarchical_probe_tests_read_output_path_as_utf8():
+    source_text = Path(__file__).read_text(encoding="utf-8")
+    bad_output_text = bytes.fromhex("e69d88e692b3e59aad").decode("utf-8")
+
+    assert 'tmp_path / "输出"' in source_text
+    assert bad_output_text not in source_text
+
+
+def test_normalize_manifest_folds_requires_explicit_fold_field():
+    folds = [
+        {"case_ids": ["case-0"]},
+        *_five_single_case_folds()[1:],
+    ]
+    case_label_map = {f"case-{index}": index % 4 for index in range(5)}
+
+    with pytest.raises(ValueError, match="每个折必须显式包含 fold 字段") as exc_info:
+        hierarchical_probe_module._normalize_manifest_folds(
+            _manifest_with(folds),
+            case_label_map,
+        )
+
+    assert str(exc_info.value).isascii() is False
+
+
+@pytest.mark.parametrize(
+    "folds, case_label_map, error_fragment",
+    [
+        (
+            [
+                *_five_single_case_folds()[:4],
+                {"fold": 4, "case_ids": ["unknown-case"]},
+            ],
+            {f"case-{index}": index % 4 for index in range(5)},
+            "未知病例编号",
+        ),
+        (
+            _five_single_case_folds(prefix="case"),
+            {f"case-{index}": index % 4 for index in range(6)},
+            "未覆盖全部恶性病例",
+        ),
+    ],
+)
+def test_normalize_manifest_folds_reports_chinese_cross_case_errors(
+    folds, case_label_map, error_fragment
+):
+    with pytest.raises(ValueError, match=error_fragment) as exc_info:
+        hierarchical_probe_module._normalize_manifest_folds(
+            _manifest_with(folds),
+            case_label_map,
+        )
+
+    assert str(exc_info.value).isascii() is False
 
 
 def test_build_hierarchical_tasks_returns_three_expected_tasks():
@@ -379,7 +565,7 @@ def test_run_cv_hierarchical_probe_rejects_flat4_checkpoint_without_loading_weig
                 {"fold": 3, "case_ids": ["case-3"]},
                 {"fold": 4, "case_ids": ["case-4"]},
             ],
-            "0,1,2,3,4",
+            "0..4",
         ),
         (
             [
@@ -389,7 +575,7 @@ def test_run_cv_hierarchical_probe_rejects_flat4_checkpoint_without_loading_weig
                 {"fold": 3, "case_ids": ["case-3"]},
                 {"fold": 5, "case_ids": ["case-4"]},
             ],
-            "0,1,2,3,4",
+            "0..4",
         ),
     ],
 )
@@ -398,18 +584,18 @@ def test_run_cv_hierarchical_probe_rejects_invalid_fold_ids_before_metadata_or_w
 ):
     run_dir = _make_run_dir(tmp_path)
     manifest_path = _make_manifest(tmp_path, folds)
-    output_dir = tmp_path / "杈撳嚭"
+    output_dir = tmp_path / "输出"
     output_dir.mkdir()
 
     monkeypatch.setattr(
         hierarchical_probe_module,
         "load_metadata",
-        lambda *args, **kwargs: pytest.fail("invalid fold ids should not load metadata"),
+        lambda *args, **kwargs: pytest.fail("无效折编号不应加载元数据"),
     )
     monkeypatch.setattr(
         hierarchical_probe_module.torch,
         "load",
-        lambda *args, **kwargs: pytest.fail("invalid fold ids should not load weights"),
+        lambda *args, **kwargs: pytest.fail("无效折编号不应加载权重"),
     )
 
     with pytest.raises(ValueError, match=error_fragment):

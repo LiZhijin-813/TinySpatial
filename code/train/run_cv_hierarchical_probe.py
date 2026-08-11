@@ -180,34 +180,38 @@ def _case_label_index(samples):
 
 def _validate_manifest_structure(manifest):
     if manifest.get("n_splits") != 5:
-        raise ValueError("cv_manifest requires n_splits=5")
+        raise ValueError("cv_manifest 的 n_splits 必须等于 5")
 
     folds = manifest.get("folds")
     if not isinstance(folds, list) or len(folds) != 5:
-        raise ValueError("cv_manifest requires five validation folds (五个验证折)")
+        raise ValueError("cv_manifest 的 folds 必须是包含五个验证折的列表")
 
     normalized = []
-    for default_fold, fold in enumerate(folds):
+    for fold_index, fold in enumerate(folds):
         if not isinstance(fold, dict):
-            raise ValueError("each fold must be an object")
-        fold_id = fold.get("fold", default_fold)
+            raise ValueError("cv_manifest 的每个折必须是对象")
+        if "fold" not in fold:
+            raise ValueError(
+                f"cv_manifest 每个折必须显式包含 fold 字段，第 {fold_index} 个折缺失"
+            )
+        fold_id = fold["fold"]
         if isinstance(fold_id, bool) or not isinstance(fold_id, int):
-            raise ValueError("fold id must be an integer")
+            raise ValueError("cv_manifest 的 fold 字段必须是整数")
         fold_case_ids = fold.get("case_ids")
         if not isinstance(fold_case_ids, list) or not fold_case_ids:
-            raise ValueError(f"fold {fold_id} requires non-empty case_ids")
+            raise ValueError(f"cv_manifest 第 {fold_id} 折的 case_ids 必须是非空列表")
         if any(
             not isinstance(case_id, str) or not case_id.strip()
             for case_id in fold_case_ids
         ):
-            raise ValueError(f"fold {fold_id} contains invalid case_ids")
+            raise ValueError(f"cv_manifest 第 {fold_id} 折的 case_ids 包含无效病例编号")
         if len(set(fold_case_ids)) != len(fold_case_ids):
-            raise ValueError(f"fold {fold_id} contains duplicate case_ids")
+            raise ValueError(f"cv_manifest 第 {fold_id} 折的 case_ids 包含重复病例编号")
         normalized.append({"fold": fold_id, "case_ids": list(fold_case_ids)})
 
     fold_ids = [fold["fold"] for fold in normalized]
     if sorted(fold_ids) != [0, 1, 2, 3, 4]:
-        raise ValueError("fold ids must be exactly 0,1,2,3,4")
+        raise ValueError("cv_manifest 的 fold 字段必须唯一且集合正好为 0..4")
     return normalized
 
 
@@ -222,10 +226,14 @@ def _normalize_manifest_folds(manifest, case_label_map):
 
     normalized = []
     seen_case_ids = {}
-    for default_fold, fold in enumerate(folds):
+    for fold_index, fold in enumerate(folds):
         if not isinstance(fold, dict):
             raise ValueError("病例组清单中的每一折都必须是对象")
-        fold_id = fold.get("fold", default_fold)
+        if "fold" not in fold:
+            raise ValueError(
+                f"病例组清单每个折必须显式包含 fold 字段，第 {fold_index} 个折缺失"
+            )
+        fold_id = fold["fold"]
         if isinstance(fold_id, bool) or not isinstance(fold_id, int):
             raise ValueError("病例组清单中的折编号必须是整数")
         fold_case_ids = fold.get("case_ids")
