@@ -84,18 +84,45 @@ def aggregate_binary_metrics(fold_metrics):
     if not fold_metrics:
         raise ValueError("折级指标不能为空")
 
-    aggregated = {}
-    for metric_name in ("macro_f1", "balanced_accuracy"):
-        values = [float(metrics[metric_name]) for metrics in fold_metrics]
+    def _summarize(values):
+        values = [float(value) for value in values]
         mean_value = sum(values) / len(values)
         variance = sum(
             (value - mean_value) ** 2 for value in values
         ) / len(values)
-        aggregated[metric_name] = {
+        return {
             "mean": float(mean_value),
             "std": float(math.sqrt(variance)),
-            "values": [float(value) for value in values],
+            "values": values,
         }
+
+    aggregated = {}
+    for metric_name in (
+        "accuracy",
+        "balanced_accuracy",
+        "macro_precision",
+        "macro_recall",
+        "macro_f1",
+        "weighted_f1",
+    ):
+        if all(metric_name in metrics for metrics in fold_metrics):
+            aggregated[metric_name] = _summarize(
+                [metrics[metric_name] for metrics in fold_metrics]
+            )
+
+    if all("per_class" in metrics for metrics in fold_metrics):
+        class_names = list(fold_metrics[0]["per_class"])
+        per_class = {}
+        for class_name in class_names:
+            per_class[class_name] = {}
+            for metric_name in ("recall", "precision", "specificity", "f1"):
+                per_class[class_name][metric_name] = _summarize(
+                    [
+                        metrics["per_class"][class_name][metric_name]
+                        for metrics in fold_metrics
+                    ]
+                )
+        aggregated["per_class"] = per_class
     return aggregated
 
 
@@ -149,6 +176,39 @@ def _case_label_index(samples):
             raise ValueError("恶性元数据包含无效亚型标签")
         index[case_id] = label
     return index
+
+
+def _validate_manifest_structure(manifest):
+    if manifest.get("n_splits") != 5:
+        raise ValueError("cv_manifest requires n_splits=5")
+
+    folds = manifest.get("folds")
+    if not isinstance(folds, list) or len(folds) != 5:
+        raise ValueError("cv_manifest requires five validation folds (五个验证折)")
+
+    normalized = []
+    for default_fold, fold in enumerate(folds):
+        if not isinstance(fold, dict):
+            raise ValueError("each fold must be an object")
+        fold_id = fold.get("fold", default_fold)
+        if isinstance(fold_id, bool) or not isinstance(fold_id, int):
+            raise ValueError("fold id must be an integer")
+        fold_case_ids = fold.get("case_ids")
+        if not isinstance(fold_case_ids, list) or not fold_case_ids:
+            raise ValueError(f"fold {fold_id} requires non-empty case_ids")
+        if any(
+            not isinstance(case_id, str) or not case_id.strip()
+            for case_id in fold_case_ids
+        ):
+            raise ValueError(f"fold {fold_id} contains invalid case_ids")
+        if len(set(fold_case_ids)) != len(fold_case_ids):
+            raise ValueError(f"fold {fold_id} contains duplicate case_ids")
+        normalized.append({"fold": fold_id, "case_ids": list(fold_case_ids)})
+
+    fold_ids = [fold["fold"] for fold in normalized]
+    if sorted(fold_ids) != [0, 1, 2, 3, 4]:
+        raise ValueError("fold ids must be exactly 0,1,2,3,4")
+    return normalized
 
 
 def _normalize_manifest_folds(manifest, case_label_map):
@@ -292,13 +352,17 @@ def run_cv_hierarchical_probe(
         raise ValueError("batch_size 必须是正整数")
 
     manifest = _read_json(cv_manifest)
+    manifest_folds = _validate_manifest_structure(manifest)
     samples = load_metadata(
         PROJECT_ROOT / "data" / saved_args.get("malignant_metadata", "metadata.csv"),
         "malignant",
     )
     case_label_map = _case_label_index(samples)
     ordered_case_ids = [sample["case_id"] for sample in samples]
-    folds = _normalize_manifest_folds(manifest, case_label_map)
+    folds = _normalize_manifest_folds(
+        {"n_splits": 5, "folds": manifest_folds},
+        case_label_map,
+    )
     tasks = build_hierarchical_tasks()
     _validate_hierarchical_boundaries(
         folds,

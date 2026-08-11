@@ -154,6 +154,92 @@ def test_aggregate_binary_metrics_returns_mean_std_and_values():
     )
 
 
+def test_aggregate_binary_metrics_summarizes_complete_metrics_and_per_class():
+    aggregated = aggregate_binary_metrics(
+        [
+            {
+                "accuracy": 0.5,
+                "balanced_accuracy": 0.5,
+                "macro_precision": 0.25,
+                "macro_recall": 0.5,
+                "macro_f1": 0.3333333333,
+                "weighted_f1": 0.3333333333,
+                "per_class": {
+                    "Luminal": {
+                        "recall": 1.0,
+                        "precision": 0.5,
+                        "specificity": 0.0,
+                        "f1": 2 / 3,
+                    },
+                    "Non-Luminal": {
+                        "recall": 0.0,
+                        "precision": 0.0,
+                        "specificity": 1.0,
+                        "f1": 0.0,
+                    },
+                },
+            },
+            {
+                "accuracy": 1.0,
+                "balanced_accuracy": 1.0,
+                "macro_precision": 1.0,
+                "macro_recall": 1.0,
+                "macro_f1": 1.0,
+                "weighted_f1": 1.0,
+                "per_class": {
+                    "Luminal": {
+                        "recall": 1.0,
+                        "precision": 1.0,
+                        "specificity": 1.0,
+                        "f1": 1.0,
+                    },
+                    "Non-Luminal": {
+                        "recall": 1.0,
+                        "precision": 1.0,
+                        "specificity": 1.0,
+                        "f1": 1.0,
+                    },
+                },
+            },
+        ]
+    )
+
+    assert set(aggregated) == {
+        "accuracy",
+        "balanced_accuracy",
+        "macro_precision",
+        "macro_recall",
+        "macro_f1",
+        "weighted_f1",
+        "per_class",
+    }
+    assert aggregated["accuracy"] == {
+        "mean": 0.75,
+        "std": 0.25,
+        "values": [0.5, 1.0],
+    }
+    assert aggregated["macro_precision"] == {
+        "mean": 0.625,
+        "std": 0.375,
+        "values": [0.25, 1.0],
+    }
+    assert aggregated["per_class"]["Luminal"]["precision"] == {
+        "mean": 0.75,
+        "std": 0.25,
+        "values": [0.5, 1.0],
+    }
+    assert aggregated["per_class"]["Non-Luminal"]["recall"] == {
+        "mean": 0.5,
+        "std": 0.5,
+        "values": [0.0, 1.0],
+    }
+    assert aggregated["per_class"]["Non-Luminal"]["specificity"] == {
+        "mean": 1.0,
+        "std": 0.0,
+        "values": [1.0, 1.0],
+    }
+
+
 def test_aggregate_binary_metrics_rejects_empty_metrics():
     with pytest.raises(ValueError, match="不能为空"):
         aggregate_binary_metrics([])
@@ -273,6 +359,60 @@ def test_run_cv_hierarchical_probe_rejects_flat4_checkpoint_without_loading_weig
     )
 
     with pytest.raises(ValueError, match="flat5"):
+        run_cv_hierarchical_probe(
+            run_dir,
+            manifest_path,
+            output_dir,
+            device_name="cpu",
+            batch_size=2,
+        )
+
+
+@pytest.mark.parametrize(
+    "folds, error_fragment",
+    [
+        (
+            [
+                {"fold": 0, "case_ids": ["case-0"]},
+                {"fold": 1, "case_ids": ["case-1"]},
+                {"fold": 1, "case_ids": ["case-2"]},
+                {"fold": 3, "case_ids": ["case-3"]},
+                {"fold": 4, "case_ids": ["case-4"]},
+            ],
+            "0,1,2,3,4",
+        ),
+        (
+            [
+                {"fold": 0, "case_ids": ["case-0"]},
+                {"fold": 1, "case_ids": ["case-1"]},
+                {"fold": 2, "case_ids": ["case-2"]},
+                {"fold": 3, "case_ids": ["case-3"]},
+                {"fold": 5, "case_ids": ["case-4"]},
+            ],
+            "0,1,2,3,4",
+        ),
+    ],
+)
+def test_run_cv_hierarchical_probe_rejects_invalid_fold_ids_before_metadata_or_weights(
+    tmp_path, monkeypatch, folds, error_fragment
+):
+    run_dir = _make_run_dir(tmp_path)
+    manifest_path = _make_manifest(tmp_path, folds)
+    output_dir = tmp_path / "杈撳嚭"
+    output_dir.mkdir()
+
+    monkeypatch.setattr(
+        hierarchical_probe_module,
+        "load_metadata",
+        lambda *args, **kwargs: pytest.fail("invalid fold ids should not load metadata"),
+    )
+    monkeypatch.setattr(
+        hierarchical_probe_module.torch,
+        "load",
+        lambda *args, **kwargs: pytest.fail("invalid fold ids should not load weights"),
+    )
+
+    with pytest.raises(ValueError, match=error_fragment):
         run_cv_hierarchical_probe(
             run_dir,
             manifest_path,
