@@ -32,7 +32,7 @@ def test_build_hierarchical_tasks_returns_three_expected_tasks():
     }
 
 
-def test_层级任务内部筛选会排除无关类别():
+def test_select_hierarchical_labels_filters_unrelated_classes():
     tasks = build_hierarchical_tasks()
     mask, binary = select_hierarchical_labels(
         torch.tensor([0, 1, 2, 3, 0]),
@@ -42,7 +42,7 @@ def test_层级任务内部筛选会排除无关类别():
     assert binary.tolist() == [0, 1, 0]
 
 
-def test_层级任务会拒绝四类空间之外的标签():
+def test_select_hierarchical_labels_rejects_out_of_range_labels():
     tasks = build_hierarchical_tasks()
     with pytest.raises(ValueError, match="标签"):
         select_hierarchical_labels(
@@ -52,15 +52,17 @@ def test_层级任务会拒绝四类空间之外的标签():
 
 
 @pytest.mark.parametrize(
-    "labels, 错误片段",
+    "labels, error_fragment",
     [
         (torch.tensor([[0, 1]]), "一维"),
         (torch.tensor([0.0, 1.0]), "整数"),
         (torch.tensor([-1, 1]), "四分类空间"),
     ],
 )
-def test_层级任务会拒绝非法标签输入(labels, 错误片段):
+def test_select_hierarchical_labels_rejects_invalid_input(
+    labels, error_fragment
+):
     tasks = build_hierarchical_tasks()
 
-    with pytest.raises(ValueError, match=错误片段):
+    with pytest.raises(ValueError, match=error_fragment):
         select_hierarchical_labels(labels, tasks["luminal_vs_non_luminal"])

@@ -3,15 +3,15 @@
 ## 任务范围
 
 - 测试文件：`code/tests/test_hierarchical_probe.py`
-- 实现文件：`code/train/run_cv_hierarchical_probe.py`
 - 报告文件：`.superpowers/sdd/task-1-report.md`
 
 ## 本轮修复内容
 
-1. 补全 `build_hierarchical_tasks()` 的契约测试，完整断言三个任务键及其 `positive_labels`、`negative_labels`、`display_names`。
-2. 增加 `select_hierarchical_labels()` 的非法输入测试，覆盖负数、一维以外张量、非整数张量三类输入。
+1. 将 `build_hierarchical_tasks()` 的测试补全为三个任务的完整契约断言。
+2. 增加 `select_hierarchical_labels()` 对负数、非一维、非整数标签的拒绝测试。
+3. 将测试文件中的中文标识符整理为 ASCII 标识符，保留中文断言字符串，确保源码可直接按 UTF-8 读取。
 
-本轮没有新增生产逻辑；现有实现已经满足新增测试，因此保持实现不变。
+本轮没有修改生产实现文件，现有实现已经满足新增测试，因此保持实现不变。
 
 ## RED
 
@@ -66,11 +66,10 @@ ModuleNotFoundError: No module named 'torch'
 ## 提交哈希
 
 - 首次完成提交：`5a1001a7902e40da7c1c28a11f373a3919ff950c`
-- 本轮修复提交：待提交后更新
+- 当前修复提交：待提交后更新
 
 ## 自检结论
 
-- 新增测试覆盖了任务配置完整性和非法标签输入边界。
-- `select_hierarchical_labels()` 已能正确拒绝负数、非一维、非整数标签。
-- 运行结果稳定为 `6 passed`，仅有 pytest 缓存目录写入警告。
+- 新增测试完整覆盖了任务配置和非法标签输入边界。
+- 当前实现已通过全部层级探针测试，未新增生产逻辑。
 - 除 `.hf_cache/` 和 pytest 缓存外，没有新增无关工作区改动。
