@@ -19,7 +19,7 @@
 
 ---
 
-### 任务 1（Task 1）：为层级标签纯函数编写失败测试
+### Task 1：为层级标签纯函数编写失败测试
 
 **文件：**
 - 新增：`D:/Project/TinySpatial/code/tests/test_hierarchical_probe.py`
@@ -125,7 +125,7 @@ git add code/tests/test_hierarchical_probe.py code/train/run_cv_hierarchical_pro
 git commit -m "新增层级探针标签筛选函数"
 ```
 
-### 任务 2（Task 2）：增加指标聚合和折内有效样本校验
+### Task 2：增加指标聚合和折内有效样本校验
 
 **文件：**
 - 修改：`D:/Project/TinySpatial/code/train/run_cv_hierarchical_probe.py`
@@ -205,7 +205,7 @@ git add code/tests/test_hierarchical_probe.py code/train/run_cv_hierarchical_pro
 git commit -m "增加层级探针指标聚合校验"
 ```
 
-### 任务 3（Task 3）：实现固定检查点的病例组五折层级探针流程
+### Task 3：实现固定检查点的病例组五折层级探针流程
 
 **文件：**
 - 修改：`D:/Project/TinySpatial/code/train/run_cv_hierarchical_probe.py`
@@ -261,7 +261,7 @@ git add code/tests/test_hierarchical_probe.py code/train/run_cv_hierarchical_pro
 git commit -m "新增病例组五折层级特征探针"
 ```
 
-### 任务 4（Task 4）：远端集成验证和三检查点诊断
+### Task 4：远端集成验证和三检查点诊断
 
 **文件：**
 - 远端输出：`/data/lzj813/b1-modality-diagnosis-20260809/hierarchical-probe-*`
