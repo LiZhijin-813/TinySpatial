@@ -23,6 +23,12 @@ from code.datasets.split_utils import derive_suspected_group_id, load_metadata
 
 
 TARGET_KEYWORDS = ("Luminal A", "Luminal B", "HER2", "TNBC")
+KEYWORD_LABELS = {
+    "luminal a": 0,
+    "luminal b": 1,
+    "her2": 2,
+    "tnbc": 3,
+}
 MODALITIES = {
     "bus": "BUS",
     "swe": "SWE",
@@ -41,6 +47,18 @@ def classify_text_risk(raw_text: str) -> dict:
         "contains_target_keyword": bool(hits),
         "target_keyword_hits": hits,
     }
+
+
+def text_label_mismatch(raw_text: str, subtype_label: int) -> bool:
+    """标记文本关键词与标签不一致的风险，不判定标签错误。"""
+    risk = classify_text_risk(raw_text)
+    if not risk["target_keyword_hits"]:
+        return False
+    expected_labels = {
+        KEYWORD_LABELS[keyword.casefold()]
+        for keyword in risk["target_keyword_hits"]
+    }
+    return int(subtype_label) not in expected_labels
 
 
 def audit_image_file(path: Path) -> dict:
@@ -88,10 +106,14 @@ def build_quality_summary(
         groups[group_id].append(sample)
 
     group_conflicts = []
+    cross_split_groups = []
     for group_id, group_samples in sorted(groups.items()):
         labels = sorted({int(sample["subtype_label"]) for sample in group_samples})
+        splits = sorted({str(sample.get("split", "")) for sample in group_samples})
         if len(labels) > 1:
             group_conflicts.append({"group_id": group_id, "labels": labels})
+        if len(splits) > 1:
+            cross_split_groups.append({"group_id": group_id, "splits": splits})
 
     modality_counts = {
         field: sum(bool(row.get(field)) for row in quality_rows)
@@ -104,12 +126,17 @@ def build_quality_summary(
         "multi_case_group_count": sum(len(values) > 1 for values in groups.values()),
         "label_conflict_group_count": len(group_conflicts),
         "label_conflict_groups": group_conflicts,
+        "cross_split_group_count": len(cross_split_groups),
+        "cross_split_groups": cross_split_groups,
         "modality_available_counts": modality_counts,
         "target_keyword_case_count": sum(
             bool(row.get("contains_target_keyword")) for row in quality_rows
         ),
         "label_conflict_case_count": sum(
             bool(row.get("label_conflict")) for row in quality_rows
+        ),
+        "text_label_mismatch_case_count": sum(
+            bool(row.get("text_label_mismatch")) for row in quality_rows
         ),
         "empty_text_case_count": sum(
             bool(row.get("text_is_empty")) for row in quality_rows
@@ -145,8 +172,10 @@ def write_quality_outputs(
         f"- 四类标签计数：{summary['label_counts']}",
         f"- 目标关键词病例数：{summary['target_keyword_case_count']}",
         f"- 标签冲突病例数：{summary['label_conflict_case_count']}",
+        f"- 文本关键词与标签不一致风险病例数：{summary['text_label_mismatch_case_count']}",
         f"- 多病例疑似组数：{summary['multi_case_group_count']}",
         f"- 疑似标签冲突组数：{summary['label_conflict_group_count']}",
+        f"- 跨切分疑似病例组数：{summary['cross_split_group_count']}",
         "",
         "以上均为风险统计，不自动判定标签错误，也不包含原始文本。",
     ]
@@ -177,7 +206,8 @@ def audit_samples(project_root: Path, metadata_file: str) -> tuple[list[dict], d
         case_id = sample["case_id"]
         group_id = derive_suspected_group_id(case_id)
         group_labels = {item["subtype_label"] for item in groups[group_id]}
-        text_risk = classify_text_risk(_read_text(data_dir / "texts" / f"{case_id}.json"))
+        raw_text = _read_text(data_dir / "texts" / f"{case_id}.json")
+        text_risk = classify_text_risk(raw_text)
         image_results = {
             modality: audit_image_file(
                 data_dir / "images" / directory / f"{case_id}.jpg"
@@ -191,6 +221,7 @@ def audit_samples(project_root: Path, metadata_file: str) -> tuple[list[dict], d
                 "subtype_label": int(sample["subtype_label"]),
                 "group_id": group_id,
                 "label_conflict": len(group_labels) > 1,
+                "split_conflict": len({item["split"] for item in groups[group_id]}) > 1,
                 "bus_exists": image_results["bus"]["exists"],
                 "swe_exists": image_results["swe"]["exists"],
                 "cdfi_exists": image_results["cdfi"]["exists"],
@@ -199,6 +230,9 @@ def audit_samples(project_root: Path, metadata_file: str) -> tuple[list[dict], d
                 "text_length": text_risk["text_length"],
                 "contains_target_keyword": text_risk["contains_target_keyword"],
                 "target_keyword_hits": ",".join(text_risk["target_keyword_hits"]),
+                "text_label_mismatch": text_label_mismatch(
+                    raw_text, sample["subtype_label"]
+                ),
                 "near_constant_image_count": sum(
                     result["near_constant"] for result in image_results.values()
                 ),

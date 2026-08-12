@@ -50,23 +50,28 @@ def test_build_quality_summary_counts_labels_and_risks():
             "case_id": "a-1",
             "subtype_label": 0,
             "group_id": "a",
+            "split": "train",
             "bus_exists": True,
             "swe_exists": True,
             "cdfi_exists": True,
             "text_exists": True,
             "contains_target_keyword": False,
             "label_conflict": False,
+            "text_label_mismatch": False,
         },
         {
             "case_id": "a-2",
             "subtype_label": 1,
             "group_id": "a",
+            "split": "val",
             "bus_exists": True,
             "swe_exists": False,
             "cdfi_exists": True,
             "text_exists": True,
             "contains_target_keyword": True,
             "label_conflict": True,
+            "text_label_mismatch": True,
+            "split_conflict": True,
         },
     ]
 
@@ -76,6 +81,8 @@ def test_build_quality_summary_counts_labels_and_risks():
     assert summary["multi_case_group_count"] == 1
     assert summary["target_keyword_case_count"] == 1
     assert summary["label_conflict_case_count"] == 1
+    assert summary["text_label_mismatch_case_count"] == 1
+    assert summary["cross_split_group_count"] == 1
 
 
 def test_quality_summary_is_json_serializable():
@@ -83,12 +90,15 @@ def test_quality_summary_is_json_serializable():
         "case_id": "a-1",
         "subtype_label": 0,
         "group_id": "a",
+        "split": "train",
         "bus_exists": True,
         "swe_exists": True,
         "cdfi_exists": True,
         "text_exists": True,
         "contains_target_keyword": False,
         "label_conflict": False,
+        "text_label_mismatch": False,
+        "split_conflict": False,
     }
 
     json.dumps(build_quality_summary([row], [row]), ensure_ascii=False)
