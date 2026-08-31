@@ -218,8 +218,15 @@ def _validate_device(device: torch.device) -> None:
         )
 
 
+def validate_case_limits(max_error_cases: int, max_correct_cases: int) -> None:
+    """确保 SWE 稳定性审计固定覆盖 24 个错误病例和 12 个正确病例。"""
+    if max_error_cases != 24 or max_correct_cases != 12:
+        raise ValueError("SWE 稳定性审计病例数必须固定为 24 个错误病例和 12 个正确病例")
+
+
 def run_audit(args) -> dict:
     """加载已有检查点并执行固定条件的 SWE 稳定性审计。"""
+    validate_case_limits(args.max_error_cases, args.max_correct_cases)
     if args.max_error_cases < 0 or args.max_correct_cases < 0:
         raise ValueError("病例数上限不能为负数")
     if args.batch_size <= 0:

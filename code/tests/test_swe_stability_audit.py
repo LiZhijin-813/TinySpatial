@@ -6,6 +6,7 @@ from code.train.swe_stability_audit import (
     apply_swe_perturbation,
     build_shuffle_indices,
     summarize_stability,
+    validate_case_limits,
 )
 
 
@@ -30,6 +31,11 @@ def test_shuffle_indices_are_deterministic_derangement():
 def test_shuffle_rejects_single_case():
     with pytest.raises(ValueError, match="至少需要两个病例"):
         build_shuffle_indices(["a"])
+
+
+def test_case_limits_reject_non_fixed_24_12_combination():
+    with pytest.raises(ValueError, match="必须固定为 24 个错误病例和 12 个正确病例"):
+        validate_case_limits(23, 12)
 
 
 def test_shuffle_dataset_uses_next_case_as_swe_donor():
