@@ -34,7 +34,7 @@ def test_case_comparison_rejects_duplicate_case_ids():
         build_case_comparison_rows(base_rows, shuffled_rows)
 
 
-def test_case_comparison_rejects_order_mismatch():
+def test_case_comparison_aligns_shuffled_order_to_base_order():
     base_rows = [
         {"case_id": "a", "true_label": 0, "predicted_label": 0, "confidence": 0.8},
         {"case_id": "b", "true_label": 1, "predicted_label": 1, "confidence": 0.8},
@@ -43,8 +43,27 @@ def test_case_comparison_rejects_order_mismatch():
         {"case_id": "b", "true_label": 1, "predicted_label": 0, "confidence": 0.7},
         {"case_id": "a", "true_label": 0, "predicted_label": 1, "confidence": 0.6},
     ]
+    shuffled_rows[0].update({"donor_case_id": "a", "donor_label": 0})
+    shuffled_rows[1].update({"donor_case_id": "b", "donor_label": 1})
 
-    with pytest.raises(ValueError, match="病例编号顺序不一致"):
+    result = build_case_comparison_rows(base_rows, shuffled_rows)
+
+    assert [row["case_id"] for row in result] == ["a", "b"]
+    assert [row["shuffled_predicted_label"] for row in result] == [1, 0]
+    assert [row["donor_case_id"] for row in result] == ["b", "a"]
+
+
+def test_case_comparison_rejects_case_id_set_mismatch():
+    base_rows = [
+        {"case_id": "a", "true_label": 0, "predicted_label": 0, "confidence": 0.8},
+        {"case_id": "b", "true_label": 1, "predicted_label": 1, "confidence": 0.8},
+    ]
+    shuffled_rows = [
+        {"case_id": "a", "true_label": 0, "predicted_label": 0, "confidence": 0.7},
+        {"case_id": "c", "true_label": 1, "predicted_label": 1, "confidence": 0.6},
+    ]
+
+    with pytest.raises(ValueError, match="病例编号集合不一致"):
         build_case_comparison_rows(base_rows, shuffled_rows)
 
 

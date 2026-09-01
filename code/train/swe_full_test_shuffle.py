@@ -55,11 +55,17 @@ def build_case_comparison_rows(
         set(shuffled_case_ids)
     ) != len(shuffled_case_ids):
         raise ValueError("病例编号必须唯一")
-    if base_case_ids != shuffled_case_ids:
-        raise ValueError("病例编号顺序不一致")
-    changes = compare_prediction_records(base_rows, shuffled_rows)
+    if set(base_case_ids) != set(shuffled_case_ids):
+        raise ValueError("病例编号集合不一致")
+    shuffled_by_id = {
+        row["case_id"]: row for row in shuffled_rows
+    }
+    aligned_shuffled_rows = [shuffled_by_id[case_id] for case_id in base_case_ids]
+    changes = compare_prediction_records(base_rows, aligned_shuffled_rows)
     rows = []
-    for change, base, shuffled in zip(changes, base_rows, shuffled_rows):
+    for change, base, shuffled in zip(
+        changes, base_rows, aligned_shuffled_rows
+    ):
         if base["true_label"] != shuffled["true_label"]:
             raise ValueError(f"病例 {base['case_id']} 的真实标签不一致")
         donor_case_id = shuffled.get("donor_case_id")
