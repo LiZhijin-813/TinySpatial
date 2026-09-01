@@ -36,6 +36,17 @@ from code.utils.evaluation import evaluate_predictions
 CLASS_NAMES = ["Luminal A", "Luminal B", "HER2+", "TNBC"]
 
 
+def predict_malignant_logits(class_logits: torch.Tensor):
+    """按项目恶性条件口径，仅使用前四类计算预测和置信度。"""
+    if not isinstance(class_logits, torch.Tensor) or class_logits.ndim != 2:
+        raise ValueError("class_logits 必须是二维张量")
+    if class_logits.shape[1] < len(CLASS_NAMES):
+        raise ValueError("class_logits 至少需要包含四个恶性类别")
+    malignant_probabilities = torch.softmax(class_logits[:, :4], dim=1)
+    confidence, predicted = malignant_probabilities.max(dim=1)
+    return predicted, confidence
+
+
 def build_full_shuffle_indices(case_ids: Sequence[str]) -> list[int]:
     """构造不含自配对的确定性循环错配索引。"""
     if len(case_ids) < 2:
@@ -150,8 +161,7 @@ def _predict_dataset(model, dataset, device, batch_size: int) -> list[dict]:
                 batch["input_ids"].to(device),
                 batch["attention_mask"].to(device),
             )
-            probabilities = torch.softmax(outputs["class_logits"], dim=1)
-            confidence, predicted = probabilities.max(dim=1)
+            predicted, confidence = predict_malignant_logits(outputs["class_logits"])
             donor_case_ids = batch.get("donor_case_id", batch["case_id"])
             donor_labels = batch.get("donor_label", batch["subtype_label"])
             for case_id, label, pred, conf, donor_id, donor_label in zip(

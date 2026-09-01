@@ -1,8 +1,10 @@
 import pytest
+import torch
 
 from code.train.swe_full_test_shuffle import (
     build_case_comparison_rows,
     build_full_shuffle_indices,
+    predict_malignant_logits,
     summarize_condition_metrics,
 )
 
@@ -18,6 +20,16 @@ def test_full_shuffle_is_deterministic_and_has_no_self_pairing():
 def test_full_shuffle_rejects_single_case():
     with pytest.raises(ValueError, match="至少需要两个病例"):
         build_full_shuffle_indices(["a"])
+
+
+def test_malignant_prediction_ignores_high_fifth_class_logit():
+    logits = torch.tensor([[0.0, 1.0, 0.0, 0.0, 100.0]])
+
+    predicted, confidence = predict_malignant_logits(logits)
+
+    expected_confidence = torch.softmax(logits[:, :4], dim=1)[0, 1].item()
+    assert predicted.tolist() == [1]
+    assert confidence.tolist() == pytest.approx([expected_confidence])
 
 
 def test_case_comparison_rejects_duplicate_case_ids():
