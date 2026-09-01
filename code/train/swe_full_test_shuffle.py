@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
+from numbers import Integral
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -40,6 +41,50 @@ def build_full_shuffle_indices(case_ids: Sequence[str]) -> list[int]:
     if len(case_ids) < 2:
         raise ValueError("病例错配至少需要两个病例")
     return list(range(1, len(case_ids))) + [0]
+
+
+def build_case_comparison_rows(
+    base_rows: Sequence[Mapping], shuffled_rows: Sequence[Mapping]
+) -> list[dict]:
+    """校验病例对齐和供体信息，并生成原始与错配对照记录。"""
+    if len(base_rows) != len(shuffled_rows):
+        raise ValueError("两组预测记录的病例数量不一致")
+    base_case_ids = [row.get("case_id") for row in base_rows]
+    shuffled_case_ids = [row.get("case_id") for row in shuffled_rows]
+    if len(set(base_case_ids)) != len(base_case_ids) or len(
+        set(shuffled_case_ids)
+    ) != len(shuffled_case_ids):
+        raise ValueError("病例编号必须唯一")
+    if base_case_ids != shuffled_case_ids:
+        raise ValueError("病例编号顺序不一致")
+    changes = compare_prediction_records(base_rows, shuffled_rows)
+    rows = []
+    for change, base, shuffled in zip(changes, base_rows, shuffled_rows):
+        if base["true_label"] != shuffled["true_label"]:
+            raise ValueError(f"病例 {base['case_id']} 的真实标签不一致")
+        donor_case_id = shuffled.get("donor_case_id")
+        if donor_case_id == shuffled["case_id"]:
+            raise ValueError(f"病例 {shuffled['case_id']} 的供体病例不能与当前病例相同")
+        donor_label = shuffled.get("donor_label")
+        if isinstance(donor_label, bool) or not isinstance(donor_label, Integral):
+            raise ValueError("供体标签必须是整数")
+        if not 0 <= int(donor_label) < len(CLASS_NAMES):
+            raise ValueError("供体标签必须是四分类整数")
+        rows.append(
+            {
+                "case_id": change["case_id"],
+                "true_label": int(base["true_label"]),
+                "base_predicted_label": int(change["base_predicted_label"]),
+                "shuffled_predicted_label": int(change["ablated_predicted_label"]),
+                "base_confidence": float(change["base_confidence"]),
+                "shuffled_confidence": float(change["ablated_confidence"]),
+                "confidence_delta": float(change["confidence_delta"]),
+                "prediction_changed": bool(change["prediction_changed"]),
+                "donor_case_id": donor_case_id,
+                "donor_label": int(donor_label),
+            }
+        )
+    return rows
 
 
 def _metrics_for_rows(rows: Sequence[Mapping], prediction_key: str) -> dict:
@@ -169,27 +214,7 @@ def run_audit(args) -> dict:
         raise RuntimeError(
             f"SWE 全测试集记录数异常：原始 {len(base_rows)}，错配 {len(shuffled_rows)}，预期均为 82"
         )
-    base_by_id = {row["case_id"]: row for row in base_rows}
-    shuffled_by_id = {row["case_id"]: row for row in shuffled_rows}
-    rows = []
-    for change in compare_prediction_records(base_rows, shuffled_rows):
-        case_id = change["case_id"]
-        base = base_by_id[case_id]
-        shuffled = shuffled_by_id[case_id]
-        rows.append(
-            {
-                "case_id": case_id,
-                "true_label": int(base["true_label"]),
-                "base_predicted_label": int(change["base_predicted_label"]),
-                "shuffled_predicted_label": int(change["ablated_predicted_label"]),
-                "base_confidence": float(change["base_confidence"]),
-                "shuffled_confidence": float(change["ablated_confidence"]),
-                "confidence_delta": float(change["confidence_delta"]),
-                "prediction_changed": bool(change["prediction_changed"]),
-                "donor_case_id": shuffled["donor_case_id"],
-                "donor_label": int(shuffled["donor_label"]),
-            }
-        )
+    rows = build_case_comparison_rows(base_rows, shuffled_rows)
     if len(rows) != 82:
         raise RuntimeError(f"SWE 全测试集对齐记录数异常：预期 82，实际 {len(rows)}")
     metrics = summarize_condition_metrics(rows)
@@ -225,6 +250,20 @@ def run_audit(args) -> dict:
         report_lines.append(
             f"| {label} | {values['accuracy']:.4f} | "
             f"{values['macro_f1']:.4f} | {values['balanced_accuracy']:.4f} |"
+        )
+        report_lines.extend(
+            [
+                "",
+                f"- {label}逐类 F1（Luminal A、Luminal B、HER2+、TNBC）："
+                + "、".join(f"{value:.4f}" for value in values["per_class_f1"]),
+                f"- {label}混淆矩阵："
+                + "；".join(
+                    "[" + ", ".join(str(value) for value in row) + "]"
+                    for row in values["confusion_matrix"]
+                ),
+                f"- {label}预测分布（Luminal A、Luminal B、HER2+、TNBC）："
+                + "、".join(str(value) for value in values["prediction_distribution"]),
+            ]
         )
     (output_dir / "swe_full_test_report.md").write_text(
         "\n".join(report_lines) + "\n", encoding="utf-8"
