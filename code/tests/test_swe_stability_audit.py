@@ -45,6 +45,12 @@ def test_checkpoint_task_mode_requires_flat5():
         validate_flat5_checkpoint_args({"task_mode": "flat4"})
 
 
+@pytest.mark.parametrize("manifest", [{"task_mode": "flat4"}, {}])
+def test_checkpoint_manifest_task_mode_requires_flat5(manifest):
+    with pytest.raises(ValueError, match="要求.*task_mode.*flat5"):
+        validate_flat5_checkpoint_args({"task_mode": "flat5"}, manifest)
+
+
 def test_stability_prediction_ignores_high_fifth_class_logit_on_cpu():
     class FakeDataset:
         samples = [{"case_id": "a", "subtype_label": 1}]

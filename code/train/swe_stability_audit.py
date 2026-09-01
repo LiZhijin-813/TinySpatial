@@ -43,10 +43,16 @@ CONDITIONS = (
 MALIGNANT_CLASS_COUNT = 4
 
 
-def validate_flat5_checkpoint_args(saved_args: Mapping) -> None:
-    """拒绝不是 flat5 的检查点，避免混用不同的类别空间。"""
+def validate_flat5_checkpoint_args(
+    saved_args: Mapping, manifest: Mapping | None = None
+) -> None:
+    """拒绝参数或划分清单不是 flat5 的检查点，避免混用类别空间。"""
     if not isinstance(saved_args, Mapping) or saved_args.get("task_mode") != "flat5":
         raise ValueError("SWE 审计仅支持 task_mode 为 flat5 的检查点")
+    if manifest is not None and (
+        not isinstance(manifest, Mapping) or manifest.get("task_mode") != "flat5"
+    ):
+        raise ValueError("SWE 审计要求 args.json 和 split_manifest.json 的 task_mode 均为 flat5")
 
 
 def predict_malignant_logits(class_logits: torch.Tensor):
@@ -271,8 +277,8 @@ def run_audit(args) -> dict:
     _validate_device(device)
     run_dir = Path(args.run_dir)
     saved_args = _load_json(run_dir / "args.json")
-    validate_flat5_checkpoint_args(saved_args)
     manifest = _load_json(run_dir / "split_manifest.json")
+    validate_flat5_checkpoint_args(saved_args, manifest)
     checkpoint = torch.load(
         run_dir / "best_model.pth", map_location=device, weights_only=False
     )

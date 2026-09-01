@@ -28,6 +28,12 @@ def test_full_test_checkpoint_task_mode_requires_flat5():
         validate_flat5_checkpoint_args({"task_mode": "dual_head"})
 
 
+@pytest.mark.parametrize("manifest", [{"task_mode": "flat4"}, {}])
+def test_full_test_manifest_task_mode_requires_flat5(manifest):
+    with pytest.raises(ValueError, match="要求.*task_mode.*flat5"):
+        validate_flat5_checkpoint_args({"task_mode": "flat5"}, manifest)
+
+
 def test_malignant_prediction_ignores_high_fifth_class_logit():
     logits = torch.tensor([[0.0, 1.0, 0.0, 0.0, 100.0]])
 

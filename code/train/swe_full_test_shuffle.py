@@ -209,8 +209,8 @@ def run_audit(args) -> dict:
     _validate_device(device)
     run_dir = Path(args.run_dir)
     saved_args = _load_json(run_dir / "args.json")
-    validate_flat5_checkpoint_args(saved_args)
     manifest = _load_json(run_dir / "split_manifest.json")
+    validate_flat5_checkpoint_args(saved_args, manifest)
     checkpoint = torch.load(
         run_dir / "best_model.pth", map_location=device, weights_only=False
     )
