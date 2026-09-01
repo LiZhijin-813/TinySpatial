@@ -23,7 +23,11 @@ from code.train.model_evidence_audit import (
     compare_prediction_records,
 )
 from code.train.run_artifacts import save_json
-from code.train.swe_stability_audit import SWEPerturbationDataset
+from code.train.swe_stability_audit import (
+    SWEPerturbationDataset,
+    predict_malignant_logits,
+    validate_flat5_checkpoint_args,
+)
 from code.train.train_stage2 import (
     build_eval_loader,
     build_fair_splits,
@@ -36,17 +40,6 @@ from code.utils.evaluation import evaluate_predictions
 CLASS_NAMES = ["Luminal A", "Luminal B", "HER2+", "TNBC"]
 
 
-def predict_malignant_logits(class_logits: torch.Tensor):
-    """按项目恶性条件口径，仅使用前四类计算预测和置信度。"""
-    if not isinstance(class_logits, torch.Tensor) or class_logits.ndim != 2:
-        raise ValueError("class_logits 必须是二维张量")
-    if class_logits.shape[1] < len(CLASS_NAMES):
-        raise ValueError("class_logits 至少需要包含四个恶性类别")
-    malignant_probabilities = torch.softmax(class_logits[:, :4], dim=1)
-    confidence, predicted = malignant_probabilities.max(dim=1)
-    return predicted, confidence
-
-
 def build_full_shuffle_indices(case_ids: Sequence[str]) -> list[int]:
     """构造不含自配对的确定性循环错配索引。"""
     if len(case_ids) < 2:
@@ -55,7 +48,10 @@ def build_full_shuffle_indices(case_ids: Sequence[str]) -> list[int]:
 
 
 def build_case_comparison_rows(
-    base_rows: Sequence[Mapping], shuffled_rows: Sequence[Mapping]
+    base_rows: Sequence[Mapping],
+    shuffled_rows: Sequence[Mapping],
+    expected_donor_by_case: Mapping | None = None,
+    true_label_by_case: Mapping | None = None,
 ) -> list[dict]:
     """校验病例对齐和供体信息，并生成原始与错配对照记录。"""
     if len(base_rows) != len(shuffled_rows):
@@ -68,6 +64,19 @@ def build_case_comparison_rows(
         raise ValueError("病例编号必须唯一")
     if set(base_case_ids) != set(shuffled_case_ids):
         raise ValueError("病例编号集合不一致")
+    if (expected_donor_by_case is None) != (true_label_by_case is None):
+        raise ValueError("供体映射与真实标签映射必须同时提供")
+    if expected_donor_by_case is not None:
+        case_id_set = set(base_case_ids)
+        if set(expected_donor_by_case) != case_id_set:
+            raise ValueError("供体映射病例编号集合不一致")
+        if set(true_label_by_case) != case_id_set:
+            raise ValueError("真实标签映射病例编号集合不一致")
+        expected_donor_ids = list(expected_donor_by_case.values())
+        if set(expected_donor_ids) != case_id_set or len(
+            set(expected_donor_ids)
+        ) != len(expected_donor_ids):
+            raise ValueError("供体映射必须覆盖测试集内每个病例且恰好一次")
     shuffled_by_id = {
         row["case_id"]: row for row in shuffled_rows
     }
@@ -87,6 +96,13 @@ def build_case_comparison_rows(
             raise ValueError("供体标签必须是整数")
         if not 0 <= int(donor_label) < len(CLASS_NAMES):
             raise ValueError("供体标签必须是四分类整数")
+        if expected_donor_by_case is not None:
+            if donor_case_id not in expected_donor_by_case:
+                raise ValueError("供体病例不属于测试集")
+            if donor_case_id != expected_donor_by_case[shuffled["case_id"]]:
+                raise ValueError("供体映射不符合固定循环")
+            if int(donor_label) != int(true_label_by_case[donor_case_id]):
+                raise ValueError("供体标签与供体病例真实标签不一致")
         rows.append(
             {
                 "case_id": change["case_id"],
@@ -193,6 +209,7 @@ def run_audit(args) -> dict:
     _validate_device(device)
     run_dir = Path(args.run_dir)
     saved_args = _load_json(run_dir / "args.json")
+    validate_flat5_checkpoint_args(saved_args)
     manifest = _load_json(run_dir / "split_manifest.json")
     checkpoint = torch.load(
         run_dir / "best_model.pth", map_location=device, weights_only=False
@@ -211,6 +228,18 @@ def run_audit(args) -> dict:
     malignant_test = splits["malignant_test"]
     if len(malignant_test) != 82:
         raise RuntimeError(f"完整恶性测试集病例数异常：预期 82，实际 {len(malignant_test)}")
+    case_ids = [sample["case_id"] for sample in malignant_test]
+    if len(set(case_ids)) != len(case_ids):
+        raise RuntimeError("完整恶性测试集病例编号必须唯一")
+    shuffle_indices = build_full_shuffle_indices(case_ids)
+    expected_donor_by_case = {
+        case_id: case_ids[shuffle_indices[index]]
+        for index, case_id in enumerate(case_ids)
+    }
+    true_label_by_case = {
+        sample["case_id"]: int(sample["subtype_label"])
+        for sample in malignant_test
+    }
     dataset = MultiModalBreastDataset(
         args.project_root,
         split="test",
@@ -222,7 +251,9 @@ def run_audit(args) -> dict:
     base_rows = _predict_dataset(model, dataset, device, args.batch_size)
     shuffled_rows = _predict_dataset(
         model,
-        SWEPerturbationDataset(dataset, "case_shuffle"),
+        SWEPerturbationDataset(
+            dataset, "case_shuffle", shuffle_indices=shuffle_indices
+        ),
         device,
         args.batch_size,
     )
@@ -230,7 +261,12 @@ def run_audit(args) -> dict:
         raise RuntimeError(
             f"SWE 全测试集记录数异常：原始 {len(base_rows)}，错配 {len(shuffled_rows)}，预期均为 82"
         )
-    rows = build_case_comparison_rows(base_rows, shuffled_rows)
+    rows = build_case_comparison_rows(
+        base_rows,
+        shuffled_rows,
+        expected_donor_by_case=expected_donor_by_case,
+        true_label_by_case=true_label_by_case,
+    )
     if len(rows) != 82:
         raise RuntimeError(f"SWE 全测试集对齐记录数异常：预期 82，实际 {len(rows)}")
     metrics = summarize_condition_metrics(rows)

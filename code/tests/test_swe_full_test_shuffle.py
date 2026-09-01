@@ -7,6 +7,7 @@ from code.train.swe_full_test_shuffle import (
     predict_malignant_logits,
     summarize_condition_metrics,
 )
+from code.train.swe_stability_audit import validate_flat5_checkpoint_args
 
 
 def test_full_shuffle_is_deterministic_and_has_no_self_pairing():
@@ -20,6 +21,11 @@ def test_full_shuffle_is_deterministic_and_has_no_self_pairing():
 def test_full_shuffle_rejects_single_case():
     with pytest.raises(ValueError, match="至少需要两个病例"):
         build_full_shuffle_indices(["a"])
+
+
+def test_full_test_checkpoint_task_mode_requires_flat5():
+    with pytest.raises(ValueError, match="仅支持 task_mode 为 flat5"):
+        validate_flat5_checkpoint_args({"task_mode": "dual_head"})
 
 
 def test_malignant_prediction_ignores_high_fifth_class_logit():
@@ -114,6 +120,65 @@ def test_case_comparison_rejects_self_pairing_and_invalid_donor_label():
         build_case_comparison_rows(base_rows, self_paired)
     with pytest.raises(ValueError, match="供体标签必须是整数"):
         build_case_comparison_rows(base_rows, invalid_label)
+
+
+def test_case_comparison_validates_complete_expected_cyclic_donor_mapping():
+    base_rows = [
+        {"case_id": "a", "true_label": 0, "predicted_label": 0, "confidence": 0.8},
+        {"case_id": "b", "true_label": 1, "predicted_label": 1, "confidence": 0.8},
+        {"case_id": "c", "true_label": 2, "predicted_label": 2, "confidence": 0.8},
+    ]
+    shuffled_rows = [
+        {"case_id": "a", "true_label": 0, "predicted_label": 0, "confidence": 0.7, "donor_case_id": "b", "donor_label": 1},
+        {"case_id": "b", "true_label": 1, "predicted_label": 1, "confidence": 0.7, "donor_case_id": "c", "donor_label": 2},
+        {"case_id": "c", "true_label": 2, "predicted_label": 2, "confidence": 0.7, "donor_case_id": "a", "donor_label": 0},
+    ]
+
+    rows = build_case_comparison_rows(
+        base_rows,
+        shuffled_rows,
+        expected_donor_by_case={"a": "b", "b": "c", "c": "a"},
+        true_label_by_case={"a": 0, "b": 1, "c": 2},
+    )
+
+    assert [row["donor_case_id"] for row in rows] == ["b", "c", "a"]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("outside", "供体病例不属于测试集"),
+        ("wrong_cycle", "供体映射不符合固定循环"),
+        ("wrong_label", "供体标签与供体病例真实标签不一致"),
+    ],
+)
+def test_case_comparison_rejects_invalid_expected_cyclic_donor_mapping(
+    mutation, message
+):
+    base_rows = [
+        {"case_id": "a", "true_label": 0, "predicted_label": 0, "confidence": 0.8},
+        {"case_id": "b", "true_label": 1, "predicted_label": 1, "confidence": 0.8},
+        {"case_id": "c", "true_label": 2, "predicted_label": 2, "confidence": 0.8},
+    ]
+    shuffled_rows = [
+        {"case_id": "a", "true_label": 0, "predicted_label": 0, "confidence": 0.7, "donor_case_id": "b", "donor_label": 1},
+        {"case_id": "b", "true_label": 1, "predicted_label": 1, "confidence": 0.7, "donor_case_id": "c", "donor_label": 2},
+        {"case_id": "c", "true_label": 2, "predicted_label": 2, "confidence": 0.7, "donor_case_id": "a", "donor_label": 0},
+    ]
+    if mutation == "outside":
+        shuffled_rows[0]["donor_case_id"] = "outside"
+    elif mutation == "wrong_cycle":
+        shuffled_rows[0]["donor_case_id"] = "c"
+    else:
+        shuffled_rows[0]["donor_label"] = 2
+
+    with pytest.raises(ValueError, match=message):
+        build_case_comparison_rows(
+            base_rows,
+            shuffled_rows,
+            expected_donor_by_case={"a": "b", "b": "c", "c": "a"},
+            true_label_by_case={"a": 0, "b": 1, "c": 2},
+        )
 
 
 def test_metrics_keep_fixed_four_class_shape():

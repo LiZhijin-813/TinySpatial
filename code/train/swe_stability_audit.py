@@ -40,6 +40,26 @@ CONDITIONS = (
     "horizontal_flip",
     "case_shuffle",
 )
+MALIGNANT_CLASS_COUNT = 4
+
+
+def validate_flat5_checkpoint_args(saved_args: Mapping) -> None:
+    """拒绝不是 flat5 的检查点，避免混用不同的类别空间。"""
+    if not isinstance(saved_args, Mapping) or saved_args.get("task_mode") != "flat5":
+        raise ValueError("SWE 审计仅支持 task_mode 为 flat5 的检查点")
+
+
+def predict_malignant_logits(class_logits: torch.Tensor):
+    """仅在 flat5 输出的前四个恶性类别内计算预测与置信度。"""
+    if not isinstance(class_logits, torch.Tensor) or class_logits.ndim != 2:
+        raise ValueError("class_logits 必须是二维张量")
+    if class_logits.shape[1] < MALIGNANT_CLASS_COUNT:
+        raise ValueError("class_logits 至少需要包含四个恶性类别")
+    malignant_probabilities = torch.softmax(
+        class_logits[:, :MALIGNANT_CLASS_COUNT], dim=1
+    )
+    confidence, predicted = malignant_probabilities.max(dim=1)
+    return predicted, confidence
 
 
 def apply_swe_perturbation(swe_tensor: torch.Tensor, condition: str) -> torch.Tensor:
@@ -63,17 +83,33 @@ def build_shuffle_indices(case_ids: Sequence[str]) -> list[int]:
 class SWEPerturbationDataset(Dataset):
     """只修改 SWE、保留其他输入和标签不变的数据集包装器。"""
 
-    def __init__(self, base_dataset: Dataset, condition: str):
+    def __init__(
+        self,
+        base_dataset: Dataset,
+        condition: str,
+        shuffle_indices: Sequence[int] | None = None,
+    ):
         if condition not in CONDITIONS:
             raise ValueError(f"未知 SWE 扰动条件：{condition}")
         self.base_dataset = base_dataset
         self.condition = condition
         self.samples = base_dataset.samples
-        self.shuffle_indices = (
-            build_shuffle_indices([sample["case_id"] for sample in self.samples])
-            if condition == "case_shuffle"
-            else None
-        )
+        self.shuffle_indices = None
+        if condition == "case_shuffle":
+            indices = (
+                build_shuffle_indices([sample["case_id"] for sample in self.samples])
+                if shuffle_indices is None
+                else list(shuffle_indices)
+            )
+            if len(indices) != len(self.samples):
+                raise ValueError("SWE 错配索引数量必须与病例数一致")
+            if sorted(indices) != list(range(len(self.samples))):
+                raise ValueError("SWE 错配索引必须是完整病例置换")
+            if any(index == donor_index for index, donor_index in enumerate(indices)):
+                raise ValueError("SWE 错配索引不能包含自配对")
+            self.shuffle_indices = indices
+        elif shuffle_indices is not None:
+            raise ValueError("仅病例错配条件允许指定 SWE 错配索引")
 
     def __len__(self) -> int:
         return len(self.base_dataset)
@@ -179,8 +215,7 @@ def _predict_dataset(model, dataset, device, batch_size: int) -> list[dict]:
                 batch["input_ids"].to(device),
                 batch["attention_mask"].to(device),
             )
-            probabilities = torch.softmax(outputs["class_logits"], dim=1)
-            confidence, predicted = probabilities.max(dim=1)
+            predicted, confidence = predict_malignant_logits(outputs["class_logits"])
             donor_case_ids = batch.get("donor_case_id", batch["case_id"])
             donor_labels = batch.get("donor_label", batch["subtype_label"])
             for case_id, label, pred, conf, donor_id, donor_label in zip(
@@ -236,6 +271,7 @@ def run_audit(args) -> dict:
     _validate_device(device)
     run_dir = Path(args.run_dir)
     saved_args = _load_json(run_dir / "args.json")
+    validate_flat5_checkpoint_args(saved_args)
     manifest = _load_json(run_dir / "split_manifest.json")
     checkpoint = torch.load(
         run_dir / "best_model.pth", map_location=device, weights_only=False

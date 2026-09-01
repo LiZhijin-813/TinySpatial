@@ -3,9 +3,11 @@ import torch
 
 from code.train.swe_stability_audit import (
     SWEPerturbationDataset,
+    _predict_dataset,
     apply_swe_perturbation,
     build_shuffle_indices,
     summarize_stability,
+    validate_flat5_checkpoint_args,
     validate_case_limits,
 )
 
@@ -36,6 +38,45 @@ def test_shuffle_rejects_single_case():
 def test_case_limits_reject_non_fixed_24_12_combination():
     with pytest.raises(ValueError, match="必须固定为 24 个错误病例和 12 个正确病例"):
         validate_case_limits(23, 12)
+
+
+def test_checkpoint_task_mode_requires_flat5():
+    with pytest.raises(ValueError, match="仅支持 task_mode 为 flat5"):
+        validate_flat5_checkpoint_args({"task_mode": "flat4"})
+
+
+def test_stability_prediction_ignores_high_fifth_class_logit_on_cpu():
+    class FakeDataset:
+        samples = [{"case_id": "a", "subtype_label": 1}]
+
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, index):
+            return {
+                "case_id": "a",
+                "subtype_label": 1,
+                "bus_img": torch.zeros(1),
+                "swe_img": torch.zeros(1),
+                "cdfi_img": torch.zeros(1),
+                "input_ids": torch.ones(1, dtype=torch.long),
+                "attention_mask": torch.ones(1, dtype=torch.long),
+            }
+
+    class FakeModel:
+        def eval(self):
+            return self
+
+        def __call__(self, *unused_args):
+            return {"class_logits": torch.tensor([[0.0, 1.0, 0.0, 0.0, 100.0]])}
+
+    rows = _predict_dataset(FakeModel(), FakeDataset(), torch.device("cpu"), 1)
+
+    expected_confidence = torch.softmax(
+        torch.tensor([[0.0, 1.0, 0.0, 0.0]]), dim=1
+    )[0, 1].item()
+    assert rows[0]["predicted_label"] == 1
+    assert rows[0]["confidence"] == pytest.approx(expected_confidence)
 
 
 def test_shuffle_dataset_uses_next_case_as_swe_donor():
