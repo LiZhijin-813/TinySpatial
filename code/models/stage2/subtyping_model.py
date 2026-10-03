@@ -29,6 +29,7 @@ from .ip_adapter import DecoupledAttentionLayer
 from .text_branch import TextLogicBranch
 from .cross_attention import LightweightCrossAttention
 from .task_heads import Stage2TaskHeads
+from .swe_residual import SWEResidualBranch
 
 
 class SECSubtypingModel(nn.Module):
@@ -59,6 +60,7 @@ class SECSubtypingModel(nn.Module):
         ip_adapter_layers: list = None,
         ip_adapter_scale: float = 0.1,
         unfreeze_last_n: int = 2,
+        fusion_mode: str = "legacy",
     ):
         """
         Args:
@@ -74,6 +76,10 @@ class SECSubtypingModel(nn.Module):
             unfreeze_last_n: 解冻编码器最后 N 层，默认 2（保守微调，防止特征坍缩）
         """
         super().__init__()
+        if fusion_mode not in {"legacy", "bus_text", "swe_residual"}:
+            raise ValueError(f"未知融合模式：{fusion_mode}")
+        if fusion_mode != "legacy" and task_mode != "flat5":
+            raise ValueError("BUS+Text 成对实验仅支持 flat5 任务")
         if isinstance(depth, bool) or not isinstance(depth, int) or depth <= 0:
             raise ValueError("depth 必须是非布尔正整数")
         if (
@@ -105,7 +111,8 @@ class SECSubtypingModel(nn.Module):
         self.img_size = img_size
         self.patch_size = patch_size
         self.task_mode = task_mode
-        self.ip_adapter_layers = ip_adapter_layers
+        self.fusion_mode = fusion_mode
+        self.ip_adapter_layers = ip_adapter_layers if fusion_mode == "legacy" else []
 
         # ===== 1. BUS+SWE 分支: JointPatchEmbedding + TinyUSFM =====
         self.patch_embed = JointPatchEmbedding(embed_dim, patch_size)
@@ -141,12 +148,15 @@ class SECSubtypingModel(nn.Module):
             param.requires_grad = True
 
         # ===== 2. CDFI 分支 =====
-        self.cdfi_branch = CDFIBranch(out_dim=embed_dim, img_size=img_size)
+        self.cdfi_branch = (
+            CDFIBranch(out_dim=embed_dim, img_size=img_size)
+            if fusion_mode == "legacy" else nn.Identity()
+        )
 
         # ===== 3. IP-Adapter 层（默认注入最后两层） =====
         self.ip_adapters = nn.ModuleDict({
             str(i): DecoupledAttentionLayer(embed_dim=embed_dim, num_heads=num_heads, cdfi_dim=embed_dim)
-            for i in ip_adapter_layers
+            for i in self.ip_adapter_layers
         })
         for adapter in self.ip_adapters.values():
             adapter.set_ip_adapter_scale(ip_adapter_scale)
@@ -164,6 +174,10 @@ class SECSubtypingModel(nn.Module):
         self.task_heads = Stage2TaskHeads(
             input_dim=embed_dim + 512,
             task_mode=task_mode,
+        )
+        self.swe_branch = (
+            SWEResidualBranch(embed_dim)
+            if fusion_mode == "swe_residual" else nn.Identity()
         )
 
     def _load_pretrained(self, path: str):
@@ -236,10 +250,12 @@ class SECSubtypingModel(nn.Module):
         B = bus_img.shape[0]
 
         # === 提取 CDFI tokens ===
-        cdfi_tokens = self.cdfi_branch(cdfi_img)  # (B, N_cdfi, 192)
+        if self.fusion_mode == "legacy":
+            cdfi_tokens = self.cdfi_branch(cdfi_img)  # (B, N_cdfi, 192)
 
         # === BUS+SWE patch tokens ===
-        tokens = self.patch_embed(bus_img, swe_img)  # (B, N, 192)
+        patch_swe = swe_img if self.fusion_mode == "legacy" else torch.zeros_like(swe_img)
+        tokens = self.patch_embed(bus_img, patch_swe)  # (B, N, 192)
 
         # 前置 CLS token
         cls_tokens = self.encoder.cls_token.expand(B, -1, -1)
@@ -265,6 +281,8 @@ class SECSubtypingModel(nn.Module):
         cls_feat = x[:, 0, :]              # (B, 192) — CLS token
         gap_feat = x[:, 1:, :].mean(dim=1)  # (B, 192) — patch tokens 均值
         F_bus_swe = cls_feat + gap_feat      # (B, 192) — 互补融合
+        if self.fusion_mode == "swe_residual":
+            F_bus_swe = self.swe_branch(F_bus_swe, swe_img)
 
         # === 文本特征 ===
         F_text = self.text_branch(input_ids, attention_mask)  # (B, 512)

@@ -690,6 +690,61 @@ def test_optimizer_covers_every_trainable_parameter_once():
     }
 
 
+def test_new_fusion_mode_defers_test_evaluation(monkeypatch):
+    """新结构训练只返回验证结论，测试集留给锁定后的复评。"""
+    from code.train.train_stage2 import final_test_metrics
+
+    monkeypatch.setattr(
+        train_stage2_module,
+        "_evaluate_test_sets",
+        lambda *args: (_ for _ in ()).throw(AssertionError("训练阶段不应评估测试集")),
+    )
+    args = build_parser().parse_args([
+        "--pretrained_path", "TinyUSFM.pth", "--task_mode", "flat5",
+        "--fusion_mode", "swe_residual",
+    ])
+
+    assert final_test_metrics(None, {}, args, torch.device("cpu")) == {
+        "status": "deferred",
+        "malignant": None,
+        "binary": None,
+    }
+
+
+def test_new_fusion_mode_is_recorded_by_cli():
+    """命令行参数应区分成对模型与既有结构。"""
+    args = build_parser().parse_args([
+        "--pretrained_path", "TinyUSFM.pth", "--task_mode", "flat5",
+        "--fusion_mode", "bus_text",
+    ])
+
+    assert args.fusion_mode == "bus_text"
+
+
+def test_paired_modes_keep_training_order_independent_of_model_rng():
+    """成对模式的数据顺序不能受额外模型参数初始化影响。"""
+    class IndexedDataset:
+        def __len__(self):
+            return 20
+
+        def __getitem__(self, index):
+            return index
+
+    args = Namespace(
+        sampler="none", batch_size=4, num_workers=0,
+        seed=42, fusion_mode="bus_text",
+    )
+    first_loader = build_train_loader(IndexedDataset(), "flat5", args)
+    first_order = torch.cat(list(first_loader)).tolist()
+
+    torch.rand(100)
+    args.fusion_mode = "swe_residual"
+    second_loader = build_train_loader(IndexedDataset(), "flat5", args)
+    second_order = torch.cat(list(second_loader)).tolist()
+
+    assert first_order == second_order
+
+
 @pytest.mark.parametrize(
     "history, prediction_distribution",
     [

@@ -246,3 +246,60 @@ def test_pretrained_loader_skips_mismatched_tensors_and_loads_matching_ones(
     model._load_pretrained(str(checkpoint_path))
 
     assert torch.equal(model.encoder.norm.weight, expected_norm_weight)
+
+
+def test_bus_text_mode_ignores_swe_and_cdfi(monkeypatch):
+    """BUS+Text 对照组不应从 SWE 或 CDFI 读取分类信息。"""
+    torch.manual_seed(42)
+    model = _small_model(monkeypatch, task_mode="flat5", fusion_mode="bus_text")
+    model.eval()
+    bus, swe, cdfi, input_ids, attention_mask = _inputs()
+
+    first = model(bus, swe, cdfi, input_ids, attention_mask)
+    second = model(bus, swe + 2, cdfi - 3, input_ids, attention_mask)
+
+    assert torch.equal(first["class_logits"], second["class_logits"])
+    assert torch.equal(first["image_features"], second["image_features"])
+
+
+def test_swe_residual_mode_responds_only_to_swe(monkeypatch):
+    """实验组应利用 SWE 病例内容，而不接收 CDFI。"""
+    torch.manual_seed(42)
+    model = _small_model(monkeypatch, task_mode="flat5", fusion_mode="swe_residual")
+    model.eval()
+    bus, swe, cdfi, input_ids, attention_mask = _inputs()
+
+    original = model(bus, swe, cdfi, input_ids, attention_mask)
+    changed_cdfi = model(bus, swe, cdfi + 3, input_ids, attention_mask)
+    changed_swe = model(bus, swe + 2, cdfi, input_ids, attention_mask)
+
+    assert torch.equal(original["class_logits"], changed_cdfi["class_logits"])
+    assert not torch.allclose(
+        original["image_features"], changed_swe["image_features"], atol=1e-6
+    )
+
+
+def test_swe_residual_parameters_receive_gradients_and_are_optimized(monkeypatch):
+    """SWE 分支在同一分类目标下应可学习且被优化器覆盖。"""
+    from code.train.train_stage2 import build_optimizer
+
+    torch.manual_seed(42)
+    model = _small_model(monkeypatch, task_mode="flat5", fusion_mode="swe_residual")
+    optimizer = build_optimizer(model, base_lr=5e-4, weight_decay=0.05)
+    optimized = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    expected = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+    assert optimized == expected
+
+    output = model(*_inputs())
+    output["class_logits"].sum().backward()
+    assert _has_finite_nonzero_gradient(model.swe_branch.parameters())
+
+
+def test_new_fusion_modes_reject_non_flat5_task(monkeypatch):
+    """新对照协议只能用于已锁定的 flat5 任务。"""
+    with pytest.raises(ValueError, match="flat5"):
+        _small_model(monkeypatch, task_mode="flat4", fusion_mode="bus_text")

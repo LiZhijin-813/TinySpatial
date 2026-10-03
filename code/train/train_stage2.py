@@ -52,6 +52,7 @@ from code.utils.seed import seed_everything
 
 
 TASK_MODES = ("overfit", "flat4", "flat5", "dual_head")
+FUSION_MODES = ("legacy", "bus_text", "swe_residual")
 MONITOR_METRICS = (
     "malignant_macro_f1",
     "macro_f1",
@@ -118,6 +119,12 @@ def build_parser():
         choices=TASK_MODES,
         default="flat4",
         help="训练任务模式",
+    )
+    parser.add_argument(
+        "--fusion_mode",
+        choices=FUSION_MODES,
+        default="legacy",
+        help="融合结构：既有结构、BUS+Text 对照或 SWE 残差",
     )
     parser.add_argument(
         "--flat5_class_weighting",
@@ -286,6 +293,8 @@ def validate_reliable_configuration(args):
     for name in ("beta", "gamma", "label_smoothing"):
         if getattr(args, name) != 0.0:
             raise ValueError(f"可靠基线要求 {name}=0，不允许启用额外损失")
+    if getattr(args, "fusion_mode", "legacy") != "legacy" and args.task_mode != "flat5":
+        raise ValueError("BUS+Text 成对实验仅支持 flat5 任务")
     if args.lambda_bm != 0.3:
         raise ValueError("dual_head 的 lambda_bm 固定为 0.3")
     if args.monitor_metric != "malignant_macro_f1":
@@ -402,6 +411,11 @@ def build_criteria_for_mode(
 def build_train_loader(dataset, task_mode, args):
     """构建随机打乱或按当前任务标签逆频率采样的训练加载器。"""
     sampler = None
+    generator = (
+        torch.Generator().manual_seed(args.seed)
+        if getattr(args, "fusion_mode", "legacy") != "legacy"
+        else None
+    )
     if args.sampler == "balanced":
         if task_mode == "overfit":
             raise ValueError(
@@ -417,6 +431,7 @@ def build_train_loader(dataset, task_mode, args):
             sample_weights,
             num_samples=len(sample_weights),
             replacement=True,
+            generator=generator,
         )
     return DataLoader(
         dataset,
@@ -425,6 +440,7 @@ def build_train_loader(dataset, task_mode, args):
         sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=True,
+        generator=generator,
     )
 
 
@@ -499,6 +515,15 @@ def build_optimizer(model, base_lr, weight_decay):
         base_lr * 2,
         weight_decay,
     )
+    if hasattr(model, "swe_branch"):
+        _append_parameter_group(
+            groups,
+            seen,
+            model.swe_branch,
+            "swe_branch",
+            base_lr * 2,
+            weight_decay,
+        )
     for index, block in enumerate(model.encoder.blocks):
         _append_parameter_group(
             groups,
@@ -561,6 +586,7 @@ def build_model(args, device):
             task_mode=args.task_mode,
             img_size=args.img_size,
             unfreeze_last_n=args.unfreeze,
+            fusion_mode=getattr(args, "fusion_mode", "legacy"),
         )
     return model.to(device)
 
@@ -857,6 +883,13 @@ def _evaluate_test_sets(model, loaders, args, device):
     return {"malignant": malignant, "binary": binary}
 
 
+def final_test_metrics(model, loaders, args, device):
+    """新结构先锁定验证选择，测试集仅在检查点复评时读取。"""
+    if getattr(args, "fusion_mode", "legacy") != "legacy":
+        return {"status": "deferred", "malignant": None, "binary": None}
+    return _evaluate_test_sets(model, loaders, args, device)
+
+
 def main(args):
     """执行可靠基线训练、过拟合门禁或检查点确定性复评。"""
     validate_reliable_configuration(args)
@@ -957,6 +990,9 @@ def main(args):
         )
     else:
         optimizer = build_optimizer(model, args.lr, args.wd)
+
+    if getattr(args, "fusion_mode", "legacy") != "legacy":
+        seed_everything(args.seed)
 
     history = []
     best_score = -math.inf
@@ -1104,7 +1140,7 @@ def main(args):
             "binary": None,
         }
     else:
-        test_metrics = _evaluate_test_sets(
+        test_metrics = final_test_metrics(
             model,
             evaluation_loaders,
             args,
